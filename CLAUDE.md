@@ -12,7 +12,7 @@ Every shell variable in the installer — globals, arrays and `local`s — is pr
 
 ## Purpose
 
-A bash installer that sets up a PLaMo 3 Translate web service on **Ubuntu Server 26.04 (Resolute Raccoon)**, x86_64. Entry point: `bash install-plamo-3-translate.sh`.
+A bash installer that sets up a PLaMo 3 Translate web service on **Ubuntu 26.04 LTS (Resolute Raccoon)**, x86_64, Server or Desktop (tested on Server; WSL not supported). Entry point: `bash install-plamo-3-translate.sh`.
 
 ## Planned deliverables
 

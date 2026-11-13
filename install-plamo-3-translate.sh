@@ -1,5 +1,5 @@
 #!/bin/bash
-# PLaMo 3 Translate installer for Ubuntu Server 26.04 (Resolute Raccoon), x86_64.
+# PLaMo 3 Translate installer for Ubuntu 26.04 LTS (Resolute Raccoon), x86_64, Server or Desktop.
 #
 #   bash install-plamo-3-translate.sh [options]     install or update in place
 #   bash install-plamo-3-translate.sh --uninstall   uninstall

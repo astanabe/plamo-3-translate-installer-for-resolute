@@ -1,10 +1,11 @@
 # plamo-3-translate-installer-for-resolute
 
-PLaMo 3 Translate installer script for Ubuntu Server 26.04 Resolute Raccoon
+PLaMo 3 Translate installer script for Ubuntu 26.04 LTS Resolute Raccoon (Server or Desktop)
 
 # Prerequisites
 
-- Ubuntu Server 26.04 (Resolute Raccoon), x86_64
+- Ubuntu 26.04 LTS (Resolute Raccoon), x86_64, Server or Desktop (tested on Ubuntu Server; Ubuntu on WSL is not supported)
+  - On Desktop, the display also uses GPU memory, so the context size chosen automatically may be smaller; the services stop while the machine is suspended
 - Root privileges (`sudo`)
 - Internet access to GitHub (llama.cpp) and Hugging Face (models), and to the Ubuntu apt repositories
 - Enough disk space and memory for the selected model (see [Engine](#engine)); the installer checks them and warns if they look insufficient
