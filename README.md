@@ -133,7 +133,7 @@ plamo-3-translate-client.py ──────────────── TCP
 - Web server (TCP 18080 by default) (nginx-full)
   - uWSGI (`uwsgi`, `uwsgi-plugin-python3` from apt)
     - plamo-3-translate-server.py (provided in this repository)
-      - `GET /` : translation form (HTML)
+      - `GET /` : translation form (HTML). On PCs, Source text and Translation are side by side, surrounded by four Translate buttons that follow the textarea size; on phones (width below 760px), selectors, Source text, a Translate/Clear button and Translation are stacked, sized so that each screen ends at the button / at the title. Both textareas have a Copy button, and the model size and quantization reported by llama-server are shown.
       - `POST /api/translate` : JSON API
       - connects to llama-server through a UNIX socket (`/run/plamo-3-translate-llama/llama.sock`, accessible only to the service user)
 - llama-server (TCP 28080 by default) for plamo-3-translate-client.py and other OpenAI-compatible clients

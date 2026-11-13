@@ -24,9 +24,11 @@ Environment variables:
                             request is also limited to 4 x len(text) + 256 tokens
 """
 
+import html
 import http.client
 import json
 import os
+import re
 import socket
 import urllib.parse
 
@@ -263,6 +265,34 @@ def api_translate(environ, start_response):
     return _json_response(start_response, "200 OK", {"translation": translation})
 
 
+_model_label = None
+
+
+def model_label():
+    """Model size and quantization from llama-server's /props, e.g. "0.8B, Q4_K_M"."""
+    global _model_label
+    if _model_label:
+        return _model_label
+    headers = {"Authorization": "Bearer " + LLAMA_API_KEY} if LLAMA_API_KEY else {}
+    try:
+        conn, prefix = llama_connection()
+        conn.timeout = 3  # do not delay the page when llama-server is busy or down
+        try:
+            conn.request("GET", prefix + "/props", headers=headers)
+            response = conn.getresponse()
+            data = response.read()
+        finally:
+            conn.close()
+        if response.status != 200:
+            return "unknown"
+        name = os.path.basename(str(json.loads(data).get("model_path", "")))
+    except (OSError, http.client.HTTPException, ValueError, AttributeError, UpstreamError):
+        return "unknown"
+    m = re.fullmatch(r"plamo-3-translate-([0-9.]+)b-(.+)\.gguf", name, re.IGNORECASE)
+    _model_label = f"{m.group(1)}B, {m.group(2)}" if m else (name or "unknown")
+    return _model_label
+
+
 def index(environ, start_response):
     if environ.get("REQUEST_METHOD") not in ("GET", "HEAD"):
         start_response("405 Method Not Allowed", [("Allow", "GET, HEAD"), ("Content-Type", "text/plain")])
@@ -270,7 +300,8 @@ def index(environ, start_response):
     options = "\n".join(
         f'<option value="{code}">{name} ({code})</option>' for code, name in LANGUAGES
     )
-    body = INDEX_HTML.replace("@@LANGUAGE_OPTIONS@@", options).encode("utf-8")
+    body = (INDEX_HTML.replace("@@LANGUAGE_OPTIONS@@", options)
+            .replace("@@MODEL@@", html.escape(model_label()))).encode("utf-8")
     start_response("200 OK", [
         ("Content-Type", "text/html; charset=utf-8"),
         ("Content-Length", str(len(body))),
@@ -307,8 +338,12 @@ INDEX_HTML = """<!doctype html>
   * { box-sizing: border-box; }
   body { margin: 0; padding: 1.5rem 1rem; font: 15px/1.5 system-ui, sans-serif;
          color: var(--fg); background: var(--bg); }
-  main { max-width: 72rem; margin: 0 auto; }
-  h1 { font-size: 1.4rem; margin: 0 0 1rem; }
+  /* Leave room on both sides for the 150px side buttons (and the .5rem gaps), so that
+     the textareas are exactly as wide as the language selectors above them. */
+  main { width: min(72rem, calc(100% - 300px - 1rem)); margin: 0 auto; }
+  header.site { display: flex; flex-wrap: wrap; align-items: baseline; gap: .25rem 1rem; margin: 0 0 1rem; }
+  header.site h1 { font-size: 1.4rem; margin: 0; }
+  header.site .model { margin: 0; color: var(--muted); font-size: .9rem; }
   .row { display: flex; flex-wrap: wrap; gap: 1rem; }
   .row > * { flex: 1 1 18rem; min-width: 0; }
   label { display: block; font-weight: 600; margin: .75rem 0 .25rem; }
@@ -316,21 +351,76 @@ INDEX_HTML = """<!doctype html>
   textarea, select, input { width: 100%; font: inherit; color: inherit; background: var(--card);
          border: 1px solid var(--border); border-radius: 6px; padding: .5rem; }
   textarea { resize: vertical; }
-  #text, #result { min-height: 14rem; }
   #result { white-space: pre-wrap; }
+  /* Source text and Translation, surrounded by four Translate buttons.  The middle
+     column is as wide as main (the side columns extend into its margins); the middle
+     row follows the textarea height, so resizing a textarea resizes the side buttons. */
+  .translator { display: grid; grid-template-columns: 150px 1fr 150px;
+                grid-template-rows: 150px auto 150px; gap: .5rem;
+                margin: 1rem calc(-150px - .5rem) 0; }
+  .pair { grid-column: 2; grid-row: 2; display: flex; gap: 1rem; align-items: flex-start; }
+  .pair .pane { flex: 1 1 0; }
+  .go-top { grid-column: 2; grid-row: 1; }
+  .go-left { grid-column: 1; grid-row: 2; }
+  .go-right { grid-column: 3; grid-row: 2; }
+  .go-bottom { grid-column: 2; grid-row: 3; }
+  .pane { position: relative; background: var(--card); border-radius: 6px; }
+  .pane textarea { position: relative; z-index: 1; display: block; background: transparent;
+                   resize: vertical; width: 100%; height: 600px; min-height: 8rem; }
+  /* Titles drawn faintly behind the text. */
+  .pane .watermark { position: absolute; inset: 0; z-index: 0; margin: 0;
+                     display: flex; align-items: center; justify-content: center;
+                     font-size: 2.5rem; font-weight: 700; color: var(--fg); opacity: .12;
+                     pointer-events: none; user-select: none; text-align: center; }
+  /* Copy buttons in the top-right corner of each textarea (left of the scrollbar). */
+  .pane .copy { position: absolute; top: .4rem; right: 1.4rem; z-index: 2;
+                font-size: .8rem; padding: .15rem .6rem; opacity: .75; color: var(--accent);
+                background: color-mix(in srgb, var(--accent) 12%, var(--card));
+                border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--card)); }
+  .pane .copy:hover, .pane .copy:focus-visible { opacity: 1; }
   details { margin-top: .75rem; }
   summary { cursor: pointer; font-weight: 600; }
-  .actions { display: flex; align-items: center; gap: 1rem; margin-top: 1rem; }
   button { font: inherit; padding: .5rem 1.5rem; border: 0; border-radius: 6px;
            background: var(--accent); color: #fff; cursor: pointer; }
+  /* Translate buttons: a pale tint of the accent colour, close to the surroundings. */
+  .go { font-size: 1.25rem; font-weight: 600; padding: .5rem; color: var(--accent);
+        background: color-mix(in srgb, var(--accent) 16%, var(--card));
+        border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--card)); }
+  .go:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 26%, var(--card)); }
+  /* Phones: one column -- selectors, Source text, a 50px Translate/Clear button,
+     Translation, then the rest, and the title small at the bottom.  The script sizes the
+     textareas so that the first screen ends with the button and, with the button
+     scrolled to the top, the second screen ends with the title. */
+  @media (max-width: 760px) {
+    body { padding: .5rem .75rem .75rem; }
+    main { width: auto; display: flex; flex-direction: column; }
+    header.site { order: 2; justify-content: center; margin: 1rem 0 0; gap: 0 .75rem; }
+    header.site h1 { font-size: .9rem; }
+    header.site .model { font-size: .8rem; }
+    .row { gap: 0; }
+    .row > * { flex-basis: 100%; }
+    label { margin: .35rem 0 .15rem; }
+    .translator { display: flex; flex-direction: column; gap: .5rem; margin: .5rem 0 0; }
+    .pair { display: contents; }
+    .pair .pane { flex: none; }
+    .pane-src { order: 1; }
+    .go-bottom { order: 2; height: 50px; }
+    .pane-dst { order: 3; }
+    .go-top, .go-left, .go-right { display: none; }
+    .pane textarea { height: 40vh; resize: none; }
+    .pane .watermark { font-size: 1.8rem; }
+  }
   button:disabled { opacity: .5; cursor: progress; }
-  #status { color: var(--muted); }
+  #status { display: block; min-height: 1.5em; margin-top: .75rem; text-align: center; color: var(--muted); }
   #status.error { color: var(--err); }
 </style>
 </head>
 <body>
 <main>
-<h1>PLaMo 3 Translate</h1>
+<header class="site">
+  <h1>PLaMo 3 Translate</h1>
+  <p class="model">Model: @@MODEL@@</p>
+</header>
 <form id="f">
   <div class="row">
     <div>
@@ -353,16 +443,25 @@ INDEX_HTML = """<!doctype html>
       </select>
     </div>
   </div>
-  <div class="row">
-    <div>
-      <label for="text">Source text</label>
-      <textarea id="text" required></textarea>
+  <div class="translator">
+    <button class="go go-top" type="submit">Translate</button>
+    <button class="go go-left" type="submit">Translate</button>
+    <div class="pair">
+      <div class="pane pane-src">
+        <label class="watermark" for="text">Source text</label>
+        <textarea id="text" required></textarea>
+        <button class="copy" type="button" data-target="text" aria-label="Copy the source text">Copy</button>
+      </div>
+      <div class="pane pane-dst">
+        <label class="watermark" for="result">Translation</label>
+        <textarea id="result" readonly></textarea>
+        <button class="copy" type="button" data-target="result" aria-label="Copy the translation">Copy</button>
+      </div>
     </div>
-    <div>
-      <label for="result">Translation</label>
-      <textarea id="result" readonly></textarea>
-    </div>
+    <button class="go go-right" type="submit">Translate</button>
+    <button class="go go-bottom" type="submit">Translate</button>
   </div>
+  <span id="status" role="status"></span>
   <details>
     <summary>Glossary and context</summary>
     <div class="row">
@@ -376,16 +475,61 @@ INDEX_HTML = """<!doctype html>
       </div>
     </div>
   </details>
-  <div class="actions">
-    <button id="go" type="submit">Translate</button>
-    <span id="status" role="status"></span>
-  </div>
 </form>
 </main>
 <script>
 (function () {
   "use strict";
   var $ = function (id) { return document.getElementById(id); };
+  var buttons = document.querySelectorAll(".go");
+  function setBusy(busy) { buttons.forEach(function (b) { b.disabled = busy; }); }
+
+  // Phone layout: the bottom button is the single Translate/Clear button.
+  var mobile = window.matchMedia("(max-width: 760px)");
+  var mainBtn = document.querySelector(".go-bottom");
+  var clearMode = false;
+  function setClearMode(on) {
+    clearMode = on && mobile.matches;
+    mainBtn.textContent = clearMode ? "Clear" : "Translate";
+  }
+  function pageTop(el) { return el.getBoundingClientRect().top + window.scrollY; }
+  var laidOutWidth = 0;
+  function layout(force) {
+    var text = $("text"), result = $("result");
+    if (!mobile.matches) {
+      text.style.height = ""; result.style.height = ""; laidOutWidth = 0;
+      setClearMode(false);
+      return;
+    }
+    // Only when the width changes (rotation): the height also changes when the address
+    // bar or the keyboard appears, and re-laying out then would make the page jump.
+    if (!force && window.innerWidth === laidOutWidth) return;
+    laidOutWidth = window.innerWidth;
+    var vh = window.innerHeight;
+    var gap = parseFloat(getComputedStyle(mainBtn.parentNode).rowGap) || 0;
+    var btnH = mainBtn.offsetHeight;
+    // First screen: selectors, Source text and the button.
+    text.style.height = Math.max(120, vh - pageTop(text) - gap - btnH) + "px";
+    // Second screen (button at the top): button, Translation and everything after it.
+    var pageEnd = pageTop(document.querySelector("main")) + document.querySelector("main").offsetHeight
+                  + parseFloat(getComputedStyle(document.body).paddingBottom);
+    var tail = pageEnd - (pageTop(result) + result.offsetHeight);
+    result.style.height = Math.max(120, vh - btnH - gap - tail) + "px";
+  }
+  window.addEventListener("resize", function () { layout(false); });
+  if (mobile.addEventListener) mobile.addEventListener("change", function () { layout(true); });
+  window.addEventListener("load", function () { layout(true); });
+  layout(true);
+
+  mainBtn.addEventListener("click", function (ev) {
+    if (!clearMode) return;
+    ev.preventDefault();
+    $("text").value = ""; $("result").value = "";
+    $("status").textContent = ""; $("status").className = "";
+    setClearMode(false);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  });
+  $("text").addEventListener("input", function () { if (clearMode) setClearMode(false); });
   var KEY = "plamo-3-translate-settings";
   var fields = ["source_lang", "target_lang", "form"];
   try {
@@ -396,6 +540,38 @@ INDEX_HTML = """<!doctype html>
   function syncForm() { $("form").disabled = $("target_lang").value !== "ja"; }
   $("target_lang").addEventListener("change", syncForm);
   syncForm();
+
+  // Copy a textarea to the clipboard.  navigator.clipboard needs a secure context
+  // (HTTPS or localhost); over plain HTTP fall back to selecting the text and execCommand.
+  function copyText(area) {
+    var text = area.value;
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text);
+    }
+    return new Promise(function (resolve, reject) {
+      var start = area.selectionStart, end = area.selectionEnd;
+      area.focus();
+      area.select();
+      var ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) {}
+      area.setSelectionRange(start, end);
+      if (ok) { resolve(); } else { reject(new Error("copy failed")); }
+    });
+  }
+  document.querySelectorAll(".copy").forEach(function (btn) {
+    var timer = null;
+    function flash(label) {
+      btn.textContent = label;
+      clearTimeout(timer);
+      timer = setTimeout(function () { btn.textContent = "Copy"; }, 1500);
+    }
+    btn.addEventListener("click", function () {
+      var area = $(btn.dataset.target);
+      if (!area.value) { flash("Empty"); return; }
+      copyText(area).then(function () { flash("Copied"); },
+                          function () { flash("Failed"); });
+    });
+  });
 
   function parseGlossary(src) {
     var out = [];
@@ -425,8 +601,12 @@ INDEX_HTML = """<!doctype html>
       var s = {}; fields.forEach(function (k) { s[k] = $(k).value; });
       localStorage.setItem(KEY, JSON.stringify(s));
     } catch (e) {}
-    $("go").disabled = true;
+    setBusy(true);
     status.textContent = "Translating...";
+    if (mobile.matches) {
+      mainBtn.textContent = "Translating...";
+      window.scrollTo({ top: pageTop(mainBtn), behavior: "smooth" });
+    }
     var t0 = Date.now();
     fetch("api/translate", {
       method: "POST",
@@ -438,10 +618,12 @@ INDEX_HTML = """<!doctype html>
       if (d.error) throw new Error(d.error);
       $("result").value = d.translation;
       status.textContent = "Done in " + ((Date.now() - t0) / 1000).toFixed(1) + " s";
+      setClearMode(true);
     }).catch(function (e) {
       status.className = "error";
       status.textContent = "Error: " + e.message;
-    }).finally(function () { $("go").disabled = false; });
+      setClearMode(false);
+    }).finally(function () { setBusy(false); });
   });
 })();
 </script>
