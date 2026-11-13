@@ -37,6 +37,7 @@ bash install-plamo-3-translate.sh --uninstall        # uninstall
 | `--model 0.8b\|2b\|8b\|31b` | `PLAMO3_MODEL` | `2b` |
 | `--quant Q2_K\|Q3_K_M\|Q4_K_M\|Q4_0` | `PLAMO3_QUANT` | `Q4_K_M` |
 | `--backend cpu\|vulkan\|cuda12\|cuda13\|rocm` | `PLAMO3_BACKEND` | suggested from the detected GPU |
+| `--gpus all\|PCI[,PCI...]` | `PLAMO3_GPUS` | `all` (asked when the backend sees two or more GPUs) |
 | `--ctx-size N\|auto` | `PLAMO3_CTX_SIZE` | `auto` (model maximum 262144, reduced to fit the memory) |
 | `--web-port PORT` | `PLAMO3_WEB_PORT` | `18080` |
 | `--llama-port PORT` | `PLAMO3_LLAMA_PORT` | `28080` |
@@ -48,6 +49,8 @@ bash install-plamo-3-translate.sh --uninstall        # uninstall
 | `--help` | — | — |
 
 Backend suggestion: an NVIDIA GPU with a working driver (`nvidia-smi`) gives `cuda13` for driver 580 or later and `cuda12` otherwise; an AMD GPU gives `vulkan`; otherwise `cpu`. The installer does not install GPU drivers; it installs only the user-space libraries of the backend (`libvulkan1 mesa-vulkan-drivers` for Vulkan, `libhipblas3 librocblas5 libamdhip64-7` for ROCm; the CUDA runtime comes from llama.cpp's `cudart` archive).
+
+GPU selection: when the selected backend can use two or more GPUs (NVIDIA for CUDA, AMD for ROCm, NVIDIA/AMD/Intel for Vulkan), the installer lists them with their PCI addresses and asks which to use (`all` or numbers such as `1,2`). `--gpus` takes PCI addresses as shown by `lspci -D` (e.g. `0000:03:00.0`). With `all`, llama.cpp uses every GPU it supports and splits the model across them. The selection is applied with `CUDA_VISIBLE_DEVICES` (GPU UUIDs), `ROCR_VISIBLE_DEVICES` or `GGML_VK_VISIBLE_DEVICES` in the llama-server unit, and the GPUs llama-server actually uses are shown after it starts.
 
 ## Files
 
@@ -149,7 +152,7 @@ plamo-3-translate-client.py ──────────────── TCP
 
 # Procedure
 
-1. Ask user for destdir (default `/opt/plamo-3-translate`), username (default `plamo3`), model (default 2B), quantization (default Q4_K_M), llama.cpp backend, context size (default `auto`: the model maximum, reduced to fit the memory), web server port (default 18080), llama-server port (default 28080), whether to expose the llama-server, whether to open the ports in ufw (only if ufw is active and the ports are not allowed yet), and license acceptance
+1. Ask user for destdir (default `/opt/plamo-3-translate`), username (default `plamo3`), model (default 2B), quantization (default Q4_K_M), llama.cpp backend, GPUs to use (only if the backend sees two or more), context size (default `auto`: the model maximum, reduced to fit the memory), web server port (default 18080), llama-server port (default 28080), whether to expose the llama-server, whether to open the ports in ufw (only if ufw is active and the ports are not allowed yet), and license acceptance
 2. Check prerequisites: ports are not in use, enough free disk space and memory for the selected GGUF file (warn and ask to continue if insufficient)
 3. Install dependencies via apt
 4. Create the service user if needed

@@ -46,10 +46,11 @@ All services are systemd units running as the install-time user (default `plamo3
 - **Quantization**: `Q2_K`, `Q3_K_M`, `Q4_K_M` (default), `Q4_0` — `Q4_0` exists only for 0.8B and 2B; reject it for 8B/31B. GGUF file names follow `plamo-3-translate-<size>-<quant>.gguf` in `pfnet/plamo-3-translate-<size>-GGUF`.
 - **License**: PLaMo Community License must be accepted (`yes` interactively, `--accept-license` non-interactively).
 - **Re-run**: overwrite files/units, but reuse an already-downloaded GGUF.
+- **GPU selection** (`GPUS` = `all` or PCI addresses): mapped at unit-writing time to `CUDA_VISIBLE_DEVICES` (UUIDs via nvidia-smi, plus `CUDA_DEVICE_ORDER=PCI_BUS_ID`), `ROCR_VISIBLE_DEVICES` (GPU index in KFD topology node order) or `GGML_VK_VISIBLE_DEVICES` (index in `vkEnumeratePhysicalDevices` order, listed by an embedded Python ctypes script). After start-up, `report_gpus` compares the `using device ... (<PCI>)` log lines with the selection. Multi-GPU has been tested only with fake devices.
 
 ## Installer procedure (order matters)
 
-1. Prompts (destdir, username, model, quant, backend, context size, two ports, expose?, open ports in ufw? — asked only if ufw is active and the ports are not yet allowed, license). Step 6 asks about ufw again only if it was not answered here (e.g. ufw enabled meanwhile).
+1. Prompts (destdir, username, model, quant, backend, GPUs — asked only if the backend sees two or more, context size, two ports, expose?, open ports in ufw? — asked only if ufw is active and the ports are not yet allowed, license). Step 6 asks about ufw again only if it was not answered here (e.g. ufw enabled meanwhile).
 2. Prerequisite checks (ports free, disk/memory vs. GGUF size)
 3. apt install → 4. create user → 5. download llama.cpp + GGUF → 6. systemd units + nginx site, start/enable (offer to open ports if ufw is active)
 7. Smoke test: llama-server `/health`, then a real translation through nginx returning non-empty output
