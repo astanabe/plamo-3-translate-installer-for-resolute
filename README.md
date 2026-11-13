@@ -2,6 +2,16 @@
 
 PLaMo 3 Translate installer script for Ubuntu Server 26.04 Resolute Raccoon
 
+# Prerequisites
+
+- Ubuntu Server 26.04 (Resolute Raccoon), x86_64
+- Root privileges (`sudo`)
+- Internet access to GitHub (llama.cpp) and Hugging Face (models), and to the Ubuntu apt repositories
+- Enough disk space and memory for the selected model (see [Engine](#engine)); the installer checks them and warns if they look insufficient
+- **GPU driver installed in advance** (only for GPU backends). The installer does not install GPU drivers; it installs only the user-space libraries of the selected backend.
+  - NVIDIA (`cuda12`, `cuda13`): install the NVIDIA driver and reboot (e.g. `sudo ubuntu-drivers install`), so that `nvidia-smi` works. CUDA 12.8 needs driver 570 or later and CUDA 13.5 needs driver 580 or later. The installer stops if `nvidia-smi` does not work.
+  - AMD / Intel (`vulkan`, `rocm`): the in-kernel `amdgpu` / `i915` / `xe` driver must be loaded (`/dev/dri` exists; ROCm also needs `/dev/kfd`).
+
 # Usage
 
 ```
@@ -71,11 +81,17 @@ Downloads are verified with SHA-256 checksums built into the installer (llama.cp
 
 # License
 
-The models are distributed under the PLaMo Community License.
+## License of this repository
+
+The files in this repository (the installer, plamo-3-translate-server.py, plamo-3-translate-client.py and the documentation) are distributed under the MIT License. See [LICENSE](LICENSE).
+
+## License of PLaMo 3 Translate models
+
+The PLaMo 3 Translate models downloaded by the installer are not part of this repository. They are distributed by Preferred Networks, Inc. (PFN) under the PLaMo Community License, not under the MIT License.
 
 - https://plamo.preferredai.jp/info/plamo-community-license-en
 
-Personal and non-commercial use is free. Commercial use requires registration with PFN. The installer shows a summary of the license and aborts unless the user types `yes`. In non-interactive mode, `--accept-license` is required.
+Personal and non-commercial use is free. Commercial use requires registration with PFN. Read the full license text before using the models. The installer shows a summary of the license and aborts unless the user types `yes`. In non-interactive mode, `--accept-license` is required.
 
 # Engine
 
