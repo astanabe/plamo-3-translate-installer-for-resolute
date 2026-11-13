@@ -46,11 +46,12 @@ All services are systemd units running as the install-time user (default `plamo3
 - **Quantization**: `Q2_K`, `Q3_K_M`, `Q4_K_M` (default), `Q4_0` — `Q4_0` exists only for 0.8B and 2B; reject it for 8B/31B. GGUF file names follow `plamo-3-translate-<size>-<quant>.gguf` in `pfnet/plamo-3-translate-<size>-GGUF`.
 - **License**: PLaMo Community License must be accepted (`yes` interactively, `--accept-license` non-interactively).
 - **Re-run**: overwrite files/units, but reuse an already-downloaded GGUF.
+- **Interface selection** (`INTERFACES` = `all` or interface names): nginx/llama-server cannot bind to an interface, so the names are resolved to their current global addresses when the config is written (`listen_addresses`); 127.0.0.1 (and ::1 for nginx) are always added for local clients and the smoke test. ufw rules are tracked in install.conf as `UFW_RULES` (`PORT` or `PORT@IF`; legacy `UFW_PORTS` is still read); rules the installer added earlier and no longer wants are deleted on re-run. ufw shows interface rules as `PORT/tcp on IF`.
 - **GPU selection** (`GPUS` = `all` or PCI addresses): mapped at unit-writing time to `CUDA_VISIBLE_DEVICES` (UUIDs via nvidia-smi, plus `CUDA_DEVICE_ORDER=PCI_BUS_ID`), `ROCR_VISIBLE_DEVICES` (GPU index in KFD topology node order) or `GGML_VK_VISIBLE_DEVICES` (index in `vkEnumeratePhysicalDevices` order, listed by an embedded Python ctypes script). After start-up, `report_gpus` compares the `using device ... (<PCI>)` log lines with the selection. Multi-GPU has been tested only with fake devices.
 
 ## Installer procedure (order matters)
 
-1. Prompts (destdir, username, model, quant, backend, GPUs — asked only if the backend sees two or more, context size, two ports, expose?, open ports in ufw? — asked only if ufw is active and the ports are not yet allowed, license). Step 6 asks about ufw again only if it was not answered here (e.g. ufw enabled meanwhile).
+1. Prompts (destdir, username, model, quant, backend, GPUs — asked only if the backend sees two or more, context size, two ports, expose?, interfaces — asked only if two or more have global addresses, open ports in ufw? — asked only if ufw is active and the ports are not yet allowed, license). Step 6 asks about ufw again only if it was not answered here (e.g. ufw enabled meanwhile).
 2. Prerequisite checks (ports free, disk/memory vs. GGUF size)
 3. apt install → 4. create user → 5. download llama.cpp + GGUF → 6. systemd units + nginx site, start/enable (offer to open ports if ufw is active)
 7. Smoke test: llama-server `/health`, then a real translation through nginx returning non-empty output
@@ -62,3 +63,26 @@ No test suite exists yet. End-to-end verification is step 7 of the installer its
 - Static checks: `shellcheck install-plamo-3-translate.sh`, `bash -n`, `python3 -m py_compile plamo-3-translate-server.py`
 - server.py can be run without uWSGI for development: `PLAMO3_LLAMA_URL=http://127.0.0.1:<port> python3 plamo-3-translate-server.py 8080` (`PLAMO3_LLAMA_URL` takes `unix:<path>` or `http://host:port`; default is the installed socket)
 - Vulkan, CUDA and ROCm backends are untested (no supported GPU in the development machine).
+
+## TODO (handover for the next session)
+
+### Implement `plamo-3-translate-client.py`
+
+The only remaining deliverable. README already refers to it (Architecture, Client, License) — update README when it is implemented.
+
+Agreed so far:
+- CLI client that talks to **llama-server directly over TCP** (default `http://127.0.0.1:28080`), not to the web server. The TCP port exists for this client; the web server uses the UNIX socket.
+- Python standard library only (`urllib`/`http.client`, `json`, `argparse`); no pip.
+- Request format is the same as `plamo-3-translate-server.py` → `translate()`: `POST /v1/chat/completions` with `model: plamo-3-translate`, the source text as the last user message, settings in `chat_template_kwargs` (`target_lang`, `source_lang`, `form`, `glossary` as `[{source, target}]`, `context`), `temperature: 0`, `stop: ["<|plamo:tag|>", "<|plamo:bos|>"]`, bounded `max_tokens`. Validation and the 53-language list in server.py can be reused (copy; server.py is deployed as a single standalone file).
+- API key: required when llama-server is exposed (`Authorization: Bearer <key>`). The installer stores it in `/etc/plamo-3-translate/llama-server.env` (`LLAMA_API_KEY`, mode 0640 root:<service user>), which ordinary users cannot read, so the client needs its own way to get the key (option and/or environment variable).
+
+To decide with the user before implementing:
+- CLI interface: input from arguments / stdin / files, output format, option names (e.g. `--to`, `--from`, `--form`, `--glossary FILE`, `--context`), and environment variable names (follow the `PLAMO3_` prefix).
+- Whether the installer should also install the client (e.g. into `<destdir>/app/` or `/usr/local/bin`) or it is only used from this repository.
+- Whether to support long documents (splitting into paragraphs and passing previous pairs as translation history, as the model card describes) or translate the input in one request.
+
+Verification: `python3 -m py_compile`, then against an installed llama-server, both local (`127.0.0.1`) and exposed (API key required; a request without it must fail with a clear message).
+
+### Other open items
+
+- Real-hardware tests of the GPU backends (Vulkan, CUDA, ROCm) and of multi-GPU selection; in particular the ROCm index order (KFD topology) and the Vulkan PCI addresses (`VK_EXT_pci_bus_info`) are untested.

@@ -96,10 +96,10 @@ declare -A PLAMO3INS_KV_BYTES=([0.8b]=1024 [2b]=6144 [8b]=8192 [31b]=32768)
 declare -A PLAMO3INS_HEALTH_TIMEOUT=([0.8b]=180 [2b]=300 [8b]=900 [31b]=1800)
 
 # Settings: KEY -> default.  Values come from options > environment > install.conf > default.
-readonly PLAMO3INS_KEYS="DESTDIR USER MODEL QUANT BACKEND GPUS CTX_SIZE WEB_PORT LLAMA_PORT EXPOSE_LLAMA"
+readonly PLAMO3INS_KEYS="DESTDIR USER MODEL QUANT BACKEND GPUS CTX_SIZE WEB_PORT LLAMA_PORT EXPOSE_LLAMA INTERFACES"
 declare -A PLAMO3INS_DEFAULT=(
   [DESTDIR]=/opt/plamo-3-translate [USER]=plamo3 [MODEL]=2b [QUANT]=Q4_K_M [BACKEND]=""
-  [GPUS]=all [CTX_SIZE]=auto [WEB_PORT]=18080 [LLAMA_PORT]=28080 [EXPOSE_LLAMA]=no
+  [GPUS]=all [CTX_SIZE]=auto [WEB_PORT]=18080 [LLAMA_PORT]=28080 [EXPOSE_LLAMA]=no [INTERFACES]=all
 )
 declare -A PLAMO3INS_ARG=() PLAMO3INS_VAL=() PLAMO3INS_SAVED=() PLAMO3INS_FROM_USER=()
 PLAMO3INS_ACTION=install
@@ -108,7 +108,7 @@ PLAMO3INS_ACCEPT_LICENSE=no
 PLAMO3INS_OPEN_PORTS=""   # yes/no: open the ports in ufw; empty: ask when ufw is active
 PLAMO3INS_INTERACTIVE=no
 [[ -t 0 ]] && PLAMO3INS_INTERACTIVE=yes
-PLAMO3INS_UFW_PORTS=""
+PLAMO3INS_UFW_RULES=""   # ufw rules added by the installer: PORT (any interface) or PORT@INTERFACE
 PLAMO3INS_N_CTX=""
 
 # ---------------------------------------------------------------- utilities
@@ -143,6 +143,11 @@ Options (environment variable in brackets):
   --expose-llama           let llama-server listen on 0.0.0.0 with an API key
   --no-expose-llama        let llama-server listen on 127.0.0.1 only (default)
                            [PLAMO3_EXPOSE_LLAMA=yes|no]
+  --interfaces all|IF[,IF...]
+                           network interfaces on which the web server (and
+                           llama-server if exposed) accept connections from other
+                           hosts [PLAMO3_INTERFACES] (default all; asked when two or
+                           more interfaces have addresses); 127.0.0.1 always works
   --accept-license         accept the PLaMo Community License [PLAMO3_ACCEPT_LICENSE=yes]
   --open-ports             open the web server port (and the llama-server port if
                            exposed) in ufw when ufw is active
@@ -209,11 +214,11 @@ parse_args() {
   while (($#)); do
     PLAMO3INS_opt=$1
     case $PLAMO3INS_opt in
-      --destdir|--user|--model|--quant|--backend|--gpus|--ctx-size|--web-port|--llama-port)
+      --destdir|--user|--model|--quant|--backend|--gpus|--ctx-size|--web-port|--llama-port|--interfaces)
         (($# >= 2)) || die "$PLAMO3INS_opt requires a value"
         local PLAMO3INS_key=${PLAMO3INS_opt#--}; PLAMO3INS_key=${PLAMO3INS_key//-/_}; PLAMO3INS_key=${PLAMO3INS_key^^}
         PLAMO3INS_ARG[$PLAMO3INS_key]=$2; shift 2 ;;
-      --destdir=*|--user=*|--model=*|--quant=*|--backend=*|--gpus=*|--ctx-size=*|--web-port=*|--llama-port=*)
+      --destdir=*|--user=*|--model=*|--quant=*|--backend=*|--gpus=*|--ctx-size=*|--web-port=*|--llama-port=*|--interfaces=*)
         local PLAMO3INS_key=${PLAMO3INS_opt%%=*}; PLAMO3INS_key=${PLAMO3INS_key#--}; PLAMO3INS_key=${PLAMO3INS_key//-/_}; PLAMO3INS_key=${PLAMO3INS_key^^}
         PLAMO3INS_ARG[$PLAMO3INS_key]=${PLAMO3INS_opt#*=}; shift ;;
       --expose-llama) PLAMO3INS_ARG[EXPOSE_LLAMA]=yes; shift ;;
@@ -502,6 +507,115 @@ gpu_label() {
   fi
 }
 
+# ------------------------------------------------------- network interfaces
+#
+# nginx and llama-server cannot bind to an interface, so the selected interfaces are
+# turned into their current addresses when the configuration is written (re-run the
+# installer if an address changes).  127.0.0.1 (and ::1) are always included so that
+# local clients and the smoke test keep working.  ufw rules are limited with "in on IF".
+
+# Print "interface<TAB>address address ..." for each interface with a global address
+# (container and VM bridges excluded; temporary/deprecated IPv6 addresses skipped).
+net_interfaces() {
+  local PLAMO3INS_out PLAMO3INS_ifc PLAMO3INS_fam PLAMO3INS_addr PLAMO3INS_rest PLAMO3INS_order=()
+  local -A PLAMO3INS_addrs=()
+  PLAMO3INS_out=$(ip -o addr show scope global 2>/dev/null || true)
+  while read -r _ PLAMO3INS_ifc PLAMO3INS_fam PLAMO3INS_addr PLAMO3INS_rest; do
+    [[ -n $PLAMO3INS_ifc && ( $PLAMO3INS_fam == inet || $PLAMO3INS_fam == inet6 ) ]] || continue
+    [[ $PLAMO3INS_rest == *temporary* || $PLAMO3INS_rest == *deprecated* || $PLAMO3INS_rest == *tentative* ]] && continue
+    PLAMO3INS_ifc=${PLAMO3INS_ifc%%@*}
+    case $PLAMO3INS_ifc in lo|docker*|br-*|veth*|virbr*|lxdbr*|cni*) continue ;; esac
+    [[ -n ${PLAMO3INS_addrs[$PLAMO3INS_ifc]+x} ]] || PLAMO3INS_order+=("$PLAMO3INS_ifc")
+    PLAMO3INS_addrs[$PLAMO3INS_ifc]+="${PLAMO3INS_addrs[$PLAMO3INS_ifc]:+ }${PLAMO3INS_addr%/*}"
+  done <<<"$PLAMO3INS_out"
+  for PLAMO3INS_ifc in "${PLAMO3INS_order[@]}"; do
+    printf '%s\t%s\n' "$PLAMO3INS_ifc" "${PLAMO3INS_addrs[$PLAMO3INS_ifc]}"
+  done
+}
+
+# Print the addresses of the selected interfaces, one per line (nothing for "all").
+listen_addresses() {
+  local PLAMO3INS_list PLAMO3INS_ifc PLAMO3INS_addr_list=()
+  [[ ${PLAMO3INS_VAL[INTERFACES]} != all ]] || return 0
+  PLAMO3INS_list=$(net_interfaces)
+  for PLAMO3INS_ifc in ${PLAMO3INS_VAL[INTERFACES]//,/ }; do
+    read -r -a PLAMO3INS_addr_list <<<"$(awk -F '\t' -v i="$PLAMO3INS_ifc" '$1 == i {print $2}' <<<"$PLAMO3INS_list")"
+    ((${#PLAMO3INS_addr_list[@]} == 0)) || printf '%s\n' "${PLAMO3INS_addr_list[@]}"
+  done
+}
+
+interfaces_label() {
+  local PLAMO3INS_list PLAMO3INS_ifc PLAMO3INS_out=""
+  if [[ ${PLAMO3INS_VAL[INTERFACES]} == all ]]; then echo "all"; return 0; fi
+  PLAMO3INS_list=$(net_interfaces)
+  for PLAMO3INS_ifc in ${PLAMO3INS_VAL[INTERFACES]//,/ }; do
+    PLAMO3INS_out+="${PLAMO3INS_out:+, }$PLAMO3INS_ifc ($(awk -F '\t' -v i="$PLAMO3INS_ifc" '$1 == i {gsub(/ /, ", ", $2); print $2}' <<<"$PLAMO3INS_list"))"
+  done
+  echo "$PLAMO3INS_out (and 127.0.0.1)"
+}
+
+validate_interfaces() {
+  local PLAMO3INS_v=${PLAMO3INS_VAL[INTERFACES]} PLAMO3INS_list PLAMO3INS_ifc PLAMO3INS_out=()
+  if [[ -z $PLAMO3INS_v || ${PLAMO3INS_v,,} == all ]]; then PLAMO3INS_VAL[INTERFACES]=all; return 0; fi
+  PLAMO3INS_list=$(net_interfaces | cut -f1)
+  for PLAMO3INS_ifc in ${PLAMO3INS_v//,/ }; do
+    [[ $PLAMO3INS_ifc =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "invalid interface name: $PLAMO3INS_ifc"
+    if ! grep -qxF "$PLAMO3INS_ifc" <<<"$PLAMO3INS_list"; then
+      if [[ -n ${PLAMO3INS_FROM_USER[INTERFACES]:-} ]]; then
+        die "interface $PLAMO3INS_ifc has no global address (available: $(paste -sd' ' <<<"$PLAMO3INS_list"))"
+      fi
+      warn "the saved interface selection ($PLAMO3INS_v) does not match this machine; listening on all interfaces"
+      PLAMO3INS_VAL[INTERFACES]=all; return 0
+    fi
+    [[ " ${PLAMO3INS_out[*]} " == *" $PLAMO3INS_ifc "* ]] || PLAMO3INS_out+=("$PLAMO3INS_ifc")
+  done
+  PLAMO3INS_VAL[INTERFACES]=$(IFS=,; echo "${PLAMO3INS_out[*]}")
+}
+
+# Ask on which interfaces to accept connections when two or more have addresses.
+prompt_interfaces() {
+  local PLAMO3INS_list PLAMO3INS_names=() PLAMO3INS_ifc PLAMO3INS_addrs PLAMO3INS_i PLAMO3INS_default="" PLAMO3INS_answer PLAMO3INS_tok PLAMO3INS_sel=() PLAMO3INS_ok PLAMO3INS_what="the web server"
+  [[ -z ${PLAMO3INS_FROM_USER[INTERFACES]:-} && $PLAMO3INS_INTERACTIVE == yes ]] || return 0
+  PLAMO3INS_list=$(net_interfaces)
+  [[ -n $PLAMO3INS_list ]] || return 0
+  while IFS=$'\t' read -r PLAMO3INS_ifc PLAMO3INS_addrs; do PLAMO3INS_names+=("$PLAMO3INS_ifc"); done <<<"$PLAMO3INS_list"
+  ((${#PLAMO3INS_names[@]} >= 2)) || return 0
+  [[ ${PLAMO3INS_VAL[EXPOSE_LLAMA]} != yes ]] || PLAMO3INS_what="the web server and llama-server"
+  echo "Network interfaces on which $PLAMO3INS_what accept connections from other hosts"
+  echo "(127.0.0.1 is always available on this machine):"
+  PLAMO3INS_i=0
+  while IFS=$'\t' read -r PLAMO3INS_ifc PLAMO3INS_addrs; do
+    PLAMO3INS_i=$((PLAMO3INS_i + 1))
+    printf '  %d) %-12s %s\n' "$PLAMO3INS_i" "$PLAMO3INS_ifc" "${PLAMO3INS_addrs// /, }"
+  done <<<"$PLAMO3INS_list"
+  if [[ ${PLAMO3INS_VAL[INTERFACES]} == all ]]; then
+    PLAMO3INS_default=all
+  else
+    for PLAMO3INS_i in "${!PLAMO3INS_names[@]}"; do
+      [[ ",${PLAMO3INS_VAL[INTERFACES]}," == *",${PLAMO3INS_names[$PLAMO3INS_i]},"* ]] && PLAMO3INS_default+="${PLAMO3INS_default:+,}$((PLAMO3INS_i + 1))"
+    done
+  fi
+  while :; do
+    read -r -p "Interfaces (all, or numbers such as 1,2) [$PLAMO3INS_default]: " PLAMO3INS_answer || die "no input"
+    PLAMO3INS_answer=${PLAMO3INS_answer:-$PLAMO3INS_default}
+    if [[ ${PLAMO3INS_answer,,} == all ]]; then PLAMO3INS_VAL[INTERFACES]=all; return 0; fi
+    PLAMO3INS_sel=(); PLAMO3INS_ok=yes
+    for PLAMO3INS_tok in ${PLAMO3INS_answer//,/ }; do
+      if [[ $PLAMO3INS_tok =~ ^[0-9]+$ ]] && ((PLAMO3INS_tok >= 1 && PLAMO3INS_tok <= ${#PLAMO3INS_names[@]})); then
+        PLAMO3INS_ifc=${PLAMO3INS_names[$((PLAMO3INS_tok - 1))]}
+        [[ " ${PLAMO3INS_sel[*]} " == *" $PLAMO3INS_ifc "* ]] || PLAMO3INS_sel+=("$PLAMO3INS_ifc")
+      else
+        PLAMO3INS_ok=no
+      fi
+    done
+    if [[ $PLAMO3INS_ok == yes && ${#PLAMO3INS_sel[@]} -gt 0 ]]; then
+      PLAMO3INS_VAL[INTERFACES]=$(IFS=,; echo "${PLAMO3INS_sel[*]}")
+      return 0
+    fi
+    warn "answer all, or numbers between 1 and ${#PLAMO3INS_names[@]} separated by commas"
+  done
+}
+
 # ------------------------------------------------------------------ prompts
 
 prompt_values() {
@@ -520,7 +634,7 @@ prompt_values() {
   ask CTX_SIZE "Context size (auto = model maximum $PLAMO3INS_NATIVE_CTX, reduced to fit the memory; or 512-$PLAMO3INS_NATIVE_CTX)"
   ask WEB_PORT "Web server port"
   ask LLAMA_PORT "llama-server port"
-  ask EXPOSE_LLAMA "Expose llama-server on all interfaces with an API key? (yes/no)"
+  ask EXPOSE_LLAMA "Expose llama-server to other hosts (API key required)? (yes/no)"
   local PLAMO3INS_e; PLAMO3INS_e=$(yesno "${PLAMO3INS_VAL[EXPOSE_LLAMA]}")
   [[ -n $PLAMO3INS_e ]] || die "answer yes or no for exposing llama-server"
   PLAMO3INS_VAL[EXPOSE_LLAMA]=$PLAMO3INS_e
@@ -559,6 +673,7 @@ validate() {
   done
   ((PLAMO3INS_VAL[WEB_PORT] != PLAMO3INS_VAL[LLAMA_PORT])) || die "the web server and llama-server ports must differ"
   validate_gpus
+  validate_interfaces
 }
 
 validate_gpus() {
@@ -655,9 +770,10 @@ Installation settings:
   llama.cpp backend : ${PLAMO3INS_VAL[BACKEND]} (${PLAMO3INS_BACKEND_DESC[${PLAMO3INS_VAL[BACKEND]}]})
   GPUs              : $(gpu_label)
   Context size      : $(ctx_label)
+  Listen on         : $(interfaces_label)
   Open ports in ufw : $(ufw_label)
-  Web server        : http://<this host>:${PLAMO3INS_VAL[WEB_PORT]}/
-  llama-server      : $([[ ${PLAMO3INS_VAL[EXPOSE_LLAMA]} == yes ]] && echo "0.0.0.0" || echo "127.0.0.1"):${PLAMO3INS_VAL[LLAMA_PORT]}$([[ ${PLAMO3INS_VAL[EXPOSE_LLAMA]} == yes ]] && echo " (API key required)")
+  Web server        : port ${PLAMO3INS_VAL[WEB_PORT]}
+  llama-server      : port ${PLAMO3INS_VAL[LLAMA_PORT]}, $([[ ${PLAMO3INS_VAL[EXPOSE_LLAMA]} == yes ]] && echo "exposed like the web server (API key required)" || echo "127.0.0.1 only")
 
 EOF
   if [[ $PLAMO3INS_INTERACTIVE == yes && $PLAMO3INS_ASSUME_YES != yes ]]; then
@@ -927,7 +1043,13 @@ EOF
 write_units() {
   local PLAMO3INS_u=${PLAMO3INS_VAL[USER]} PLAMO3INS_d=${PLAMO3INS_VAL[DESTDIR]} PLAMO3INS_host=127.0.0.1 PLAMO3INS_groups="" PLAMO3INS_g
   local PLAMO3INS_gguf; PLAMO3INS_gguf=$(gguf_name "${PLAMO3INS_VAL[MODEL]}" "${PLAMO3INS_VAL[QUANT]}")
-  [[ ${PLAMO3INS_VAL[EXPOSE_LLAMA]} == yes ]] && PLAMO3INS_host=0.0.0.0
+  if [[ ${PLAMO3INS_VAL[EXPOSE_LLAMA]} == yes ]]; then
+    if [[ ${PLAMO3INS_VAL[INTERFACES]} == all ]]; then
+      PLAMO3INS_host=0.0.0.0
+    else
+      PLAMO3INS_host="127.0.0.1$(listen_addresses | sed 's/^/,/' | tr -d '\n')"
+    fi
+  fi
   # Without -c, llama-server uses the model maximum and reduces it to fit the memory (--fit).
   local PLAMO3INS_ctx_opt=""
   [[ ${PLAMO3INS_VAL[CTX_SIZE]} == auto ]] || PLAMO3INS_ctx_opt=" -c ${PLAMO3INS_VAL[CTX_SIZE]}"
@@ -1025,12 +1147,23 @@ EOF
 }
 
 write_nginx() {
+  local PLAMO3INS_listen="" PLAMO3INS_a PLAMO3INS_port=${PLAMO3INS_VAL[WEB_PORT]}
+  if [[ ${PLAMO3INS_VAL[INTERFACES]} == all ]]; then
+    PLAMO3INS_listen="    listen $PLAMO3INS_port;"$'\n'"    listen [::]:$PLAMO3INS_port;"
+  else
+    PLAMO3INS_listen="    listen 127.0.0.1:$PLAMO3INS_port;"
+    [[ -e /proc/net/if_inet6 ]] && PLAMO3INS_listen+=$'\n'"    listen [::1]:$PLAMO3INS_port;"
+    while read -r PLAMO3INS_a; do
+      [[ -n $PLAMO3INS_a ]] || continue
+      if [[ $PLAMO3INS_a == *:* ]]; then PLAMO3INS_listen+=$'\n'"    listen [$PLAMO3INS_a]:$PLAMO3INS_port;"
+      else PLAMO3INS_listen+=$'\n'"    listen $PLAMO3INS_a:$PLAMO3INS_port;"; fi
+    done <<<"$(listen_addresses)"
+  fi
   info "Writing nginx site configuration"
   cat > "$PLAMO3INS_NGINX_SITE" <<EOF
 # Generated by install-plamo-3-translate.sh; changes are overwritten on re-run.
 server {
-    listen ${PLAMO3INS_VAL[WEB_PORT]};
-    listen [::]:${PLAMO3INS_VAL[WEB_PORT]};
+$PLAMO3INS_listen
     server_name _;
 
     client_max_body_size 8m;
@@ -1070,14 +1203,54 @@ ufw_active() {
   grep -q '^Status: active$' <<<"$PLAMO3INS_status"
 }
 
-# Print the ports to open (web server; llama-server too if exposed) that ufw does not allow yet.
-ufw_closed_ports() {
-  local PLAMO3INS_status PLAMO3INS_p PLAMO3INS_ports=${PLAMO3INS_VAL[WEB_PORT]}
+# Print the ufw rules needed (web server; llama-server too if exposed): PORT, or
+# PORT@INTERFACE when the interfaces are restricted.
+ufw_wanted_rules() {
+  local PLAMO3INS_p PLAMO3INS_ifc PLAMO3INS_ports=${PLAMO3INS_VAL[WEB_PORT]}
   [[ ${PLAMO3INS_VAL[EXPOSE_LLAMA]} == yes ]] && PLAMO3INS_ports+=" ${PLAMO3INS_VAL[LLAMA_PORT]}"
-  PLAMO3INS_status=$(ufw status 2>/dev/null || true)
   for PLAMO3INS_p in $PLAMO3INS_ports; do
-    grep -Eq "^$PLAMO3INS_p(/tcp)?[[:space:]]+ALLOW" <<<"$PLAMO3INS_status" || echo "$PLAMO3INS_p"
+    if [[ ${PLAMO3INS_VAL[INTERFACES]} == all ]]; then
+      echo "$PLAMO3INS_p"
+    else
+      for PLAMO3INS_ifc in ${PLAMO3INS_VAL[INTERFACES]//,/ }; do echo "$PLAMO3INS_p@$PLAMO3INS_ifc"; done
+    fi
   done
+}
+
+# Print the wanted rules that ufw does not allow yet (a rule for all interfaces covers
+# every interface).
+ufw_closed_ports() {
+  local PLAMO3INS_status PLAMO3INS_r PLAMO3INS_p PLAMO3INS_ifc
+  PLAMO3INS_status=$(ufw status 2>/dev/null || true)
+  while read -r PLAMO3INS_r; do
+    [[ -n $PLAMO3INS_r ]] || continue
+    PLAMO3INS_p=${PLAMO3INS_r%%@*}
+    grep -Eq "^$PLAMO3INS_p(/tcp)?[[:space:]]+ALLOW" <<<"$PLAMO3INS_status" && continue
+    if [[ $PLAMO3INS_r == *@* ]]; then
+      PLAMO3INS_ifc=${PLAMO3INS_r#*@}
+      grep -Eq "^$PLAMO3INS_p(/tcp)? on ${PLAMO3INS_ifc//./\\.}[[:space:]]+ALLOW" <<<"$PLAMO3INS_status" && continue
+    fi
+    echo "$PLAMO3INS_r"
+  done <<<"$(ufw_wanted_rules)"
+}
+
+# Human-readable form of rules: "18080/tcp, 28080/tcp on bond0".
+ufw_rules_text() {
+  local PLAMO3INS_r PLAMO3INS_text=""
+  for PLAMO3INS_r in "$@"; do
+    if [[ $PLAMO3INS_r == *@* ]]; then PLAMO3INS_text+="${PLAMO3INS_text:+, }${PLAMO3INS_r%%@*}/tcp on ${PLAMO3INS_r#*@}"
+    else PLAMO3INS_text+="${PLAMO3INS_text:+, }$PLAMO3INS_r/tcp"; fi
+  done
+  echo "$PLAMO3INS_text"
+}
+
+# ufw arguments for a rule (used with "ufw" and "ufw delete").
+ufw_rule_args() {
+  if [[ $1 == *@* ]]; then
+    echo "allow in on ${1#*@} to any port ${1%%@*} proto tcp"
+  else
+    echo "allow ${1}/tcp"
+  fi
 }
 
 # Ask about ufw together with the other questions.  configure_ufw asks again only if
@@ -1088,7 +1261,8 @@ prompt_ufw() {
   ufw_active || return 0
   PLAMO3INS_ports=$(ufw_closed_ports | paste -sd' ' -)
   [[ -n $PLAMO3INS_ports ]] || return 0
-  if confirm "ufw is active. Allow incoming TCP on port(s) ${PLAMO3INS_ports// /, }?"; then
+  # shellcheck disable=SC2086
+  if confirm "ufw is active. Allow incoming $(ufw_rules_text $PLAMO3INS_ports)?"; then
     PLAMO3INS_OPEN_PORTS=yes
   else
     PLAMO3INS_OPEN_PORTS=no
@@ -1099,31 +1273,50 @@ ufw_label() {
   local PLAMO3INS_ports
   if ! ufw_active; then echo "no (ufw is not active)"; return 0; fi
   PLAMO3INS_ports=$(ufw_closed_ports | paste -sd' ' -)
+  # shellcheck disable=SC2086
+  PLAMO3INS_ports=$(ufw_rules_text $PLAMO3INS_ports)
   if [[ -z $PLAMO3INS_ports ]]; then echo "no (already allowed)"
-  elif [[ $PLAMO3INS_OPEN_PORTS == yes || ( -z $PLAMO3INS_OPEN_PORTS && $PLAMO3INS_ASSUME_YES == yes ) ]]; then echo "yes (${PLAMO3INS_ports// /, })"
-  elif [[ $PLAMO3INS_OPEN_PORTS == no ]]; then echo "no (${PLAMO3INS_ports// /, } stay closed)"
-  else echo "ask later (${PLAMO3INS_ports// /, })"
+  elif [[ $PLAMO3INS_OPEN_PORTS == yes || ( -z $PLAMO3INS_OPEN_PORTS && $PLAMO3INS_ASSUME_YES == yes ) ]]; then echo "yes ($PLAMO3INS_ports)"
+  elif [[ $PLAMO3INS_OPEN_PORTS == no ]]; then echo "no ($PLAMO3INS_ports stay closed)"
+  else echo "ask later ($PLAMO3INS_ports)"
   fi
 }
 
 configure_ufw() {
-  local PLAMO3INS_ports PLAMO3INS_p
+  local PLAMO3INS_ports PLAMO3INS_p PLAMO3INS_wanted PLAMO3INS_kept=""
+  PLAMO3INS_UFW_RULES=${PLAMO3INS_SAVED[UFW_RULES]:-${PLAMO3INS_SAVED[UFW_PORTS]:-}}
   ufw_active || return 0
-  PLAMO3INS_UFW_PORTS=${PLAMO3INS_SAVED[UFW_PORTS]:-}
+  # Remove rules this installer added earlier that are no longer wanted (other ports,
+  # or a rule for all interfaces after restricting the interfaces).
+  PLAMO3INS_wanted=" $(ufw_wanted_rules | paste -sd' ' -) "
+  for PLAMO3INS_p in $PLAMO3INS_UFW_RULES; do
+    if [[ $PLAMO3INS_wanted == *" $PLAMO3INS_p "* ]]; then
+      PLAMO3INS_kept+="${PLAMO3INS_kept:+ }$PLAMO3INS_p"
+    else
+      # shellcheck disable=SC2046
+      ufw delete $(ufw_rule_args "$PLAMO3INS_p") >/dev/null 2>&1 || true
+      info "Removed the ufw rule for $(ufw_rules_text "$PLAMO3INS_p") added by a previous installation"
+    fi
+  done
+  PLAMO3INS_UFW_RULES=$PLAMO3INS_kept
   PLAMO3INS_ports=$(ufw_closed_ports | paste -sd' ' -)
   if [[ -z $PLAMO3INS_ports ]]; then
     info "ufw already allows the required port(s)"
     return 0
   fi
+  # shellcheck disable=SC2086
   if [[ $PLAMO3INS_OPEN_PORTS == yes ]] ||
-     { [[ -z $PLAMO3INS_OPEN_PORTS ]] && confirm "ufw is active. Allow incoming TCP on port(s) ${PLAMO3INS_ports// /, }?"; }; then
+     { [[ -z $PLAMO3INS_OPEN_PORTS ]] && confirm "ufw is active. Allow incoming $(ufw_rules_text $PLAMO3INS_ports)?"; }; then
     for PLAMO3INS_p in $PLAMO3INS_ports; do
-      ufw allow "$PLAMO3INS_p/tcp" comment "$PLAMO3INS_APP_NAME" >/dev/null
-      [[ " $PLAMO3INS_UFW_PORTS " == *" $PLAMO3INS_p "* ]] || PLAMO3INS_UFW_PORTS=${PLAMO3INS_UFW_PORTS:+$PLAMO3INS_UFW_PORTS }$PLAMO3INS_p
+      # shellcheck disable=SC2046
+      ufw $(ufw_rule_args "$PLAMO3INS_p") comment "$PLAMO3INS_APP_NAME" >/dev/null
+      [[ " $PLAMO3INS_UFW_RULES " == *" $PLAMO3INS_p "* ]] || PLAMO3INS_UFW_RULES=${PLAMO3INS_UFW_RULES:+$PLAMO3INS_UFW_RULES }$PLAMO3INS_p
     done
-    info "Opened port(s) ${PLAMO3INS_ports// /, } in ufw"
+    # shellcheck disable=SC2086
+    info "Allowed $(ufw_rules_text $PLAMO3INS_ports) in ufw"
   else
-    warn "ufw is active and the port(s) ${PLAMO3INS_ports// /, } were not opened; other hosts cannot connect"
+    # shellcheck disable=SC2086
+    warn "ufw is active and $(ufw_rules_text $PLAMO3INS_ports) were not allowed; other hosts cannot connect"
   fi
 }
 
@@ -1133,7 +1326,7 @@ save_config() {
   {
     echo "# Written by install-plamo-3-translate.sh; used as defaults on re-run and by --uninstall."
     for PLAMO3INS_key in $PLAMO3INS_KEYS; do printf "%s='%s'\n" "$PLAMO3INS_key" "${PLAMO3INS_VAL[$PLAMO3INS_key]}"; done
-    printf "UFW_PORTS='%s'\n" "$PLAMO3INS_UFW_PORTS"
+    printf "UFW_RULES='%s'\n" "$PLAMO3INS_UFW_RULES"
   } > "$PLAMO3INS_CONF_FILE.tmp"
   chmod 0644 "$PLAMO3INS_CONF_FILE.tmp"
   mv -f "$PLAMO3INS_CONF_FILE.tmp" "$PLAMO3INS_CONF_FILE"
@@ -1220,7 +1413,9 @@ cleanup_old_models() {
 
 finish() {
   local PLAMO3INS_ip
-  PLAMO3INS_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  PLAMO3INS_ip=$(listen_addresses | sed -n '1p')
+  [[ -n $PLAMO3INS_ip ]] || PLAMO3INS_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  [[ $PLAMO3INS_ip != *:* ]] || PLAMO3INS_ip="[$PLAMO3INS_ip]"
   cat <<EOF
 
 PLaMo 3 Translate is installed.
@@ -1247,6 +1442,7 @@ do_install() {
   prompt_values
   validate
   prompt_gpus
+  prompt_interfaces
   prompt_ufw
   confirm_license
   show_summary
@@ -1307,9 +1503,13 @@ EOF
     fi
   fi
 
-  if [[ -n ${PLAMO3INS_SAVED[UFW_PORTS]:-} ]] && command -v ufw >/dev/null; then
-    for PLAMO3INS_p in ${PLAMO3INS_SAVED[UFW_PORTS]}; do
-      if ufw delete allow "$PLAMO3INS_p/tcp" >/dev/null 2>&1; then info "Removed the ufw rule for port $PLAMO3INS_p"; fi
+  local PLAMO3INS_rules=${PLAMO3INS_SAVED[UFW_RULES]:-${PLAMO3INS_SAVED[UFW_PORTS]:-}}
+  if [[ -n $PLAMO3INS_rules ]] && command -v ufw >/dev/null; then
+    for PLAMO3INS_p in $PLAMO3INS_rules; do
+      # shellcheck disable=SC2046
+      if ufw delete $(ufw_rule_args "$PLAMO3INS_p") >/dev/null 2>&1; then
+        info "Removed the ufw rule for $(ufw_rules_text "$PLAMO3INS_p")"
+      fi
     done
   fi
 
