@@ -35,7 +35,7 @@ plamo-3-translate-client.py
 
 llama-server listens on both (`--host <127.0.0.1|0.0.0.0>,<socket path>`). The socket's RuntimeDirectory is 0750 and owned by the service user; a stale socket makes llama-server fail to start, hence `ExecStartPre=rm -f`.
 
-All services are systemd units running as the install-time user (default `plamo3`, created as a system user if missing).
+llama-server and uWSGI are systemd units running as the install-time user (default `plamo3`, created as a system user if missing). nginx is the system `nginx.service`, running as its own user (`www-data`) and shared with other sites.
 
 ## Design decisions (agreed; don't change without asking)
 
@@ -43,6 +43,7 @@ All services are systemd units running as the install-time user (default `plamo3
 - **llama.cpp b12366 prebuilt binaries**; the user picks the backend (CPU / Vulkan / CUDA 12.8・13.5 / ROCm), with a default suggested from GPU detection.
 - **llama-server flags**: `--jinja --no-prefill-assistant --alias plamo-3-translate`. Context size defaults to `auto`: `-c` is omitted so llama-server uses the native 262144 and its `--fit` (on by default) shrinks it to fit memory; `-c 0` or an explicit `-c N` disables that shrinking. `--ctx-size N` (512–262144) passes `-c N`. Timeouts (1 h) and body limits (8 MiB) are sized for long documents. The model's GGUF ships a chat template that takes translation settings (`target_lang`, `source_lang`, `form`, glossary) via `chat_template_kwargs` or a `[plamo-translate]` system block — see the model card on Hugging Face.
 - **Exposure**: llama-server's TCP port binds `127.0.0.1` by default; when exposed, `0.0.0.0` plus an installer-generated `--api-key` (passed as `LLAMA_API_KEY` via EnvironmentFile; it applies to the socket too). The web server has no TLS/auth (out of scope).
+- **Shared nginx**: nginx may serve unrelated sites (80/443, reverse proxies), so the installer writes only its own site file (never `nginx.conf`, `conf.d` or `default`; no http-level settings, no `default_server`), reloads instead of restarting, and enables/starts nginx only when needed, with a warning. `write_nginx` restores the previous site file when `nginx -t` fails. The uWSGI socket is `<service user>:<nginx group>` 0660; `detect_nginx_group` reads the group from the `user` directive (`nginx -T`, falling back to `/etc/nginx/nginx.conf`, then to `www-data`).
 - **Quantization**: `Q2_K`, `Q3_K_M`, `Q4_K_M` (default), `Q4_0` — `Q4_0` exists only for 0.8B and 2B; reject it for 8B/31B. GGUF file names follow `plamo-3-translate-<size>-<quant>.gguf` in `pfnet/plamo-3-translate-<size>-GGUF`.
 - **License**: PLaMo Community License must be accepted (`yes` interactively, `--accept-license` non-interactively).
 - **Re-run**: overwrite files/units, but reuse an already-downloaded GGUF.
@@ -60,6 +61,7 @@ All services are systemd units running as the install-time user (default `plamo3
 
 No test suite exists yet. End-to-end verification is step 7 of the installer itself.
 
+- `write_nginx` can be tested without root by extracting the function into a script with a stub `nginx` function and temporary `PLAMO3INS_NGINX_SITE` / `PLAMO3INS_NGINX_LINK` paths.
 - Static checks: `shellcheck install-plamo-3-translate.sh`, `bash -n`, `python3 -m py_compile plamo-3-translate-server.py plamo-3-translate-client.py`
 - The client can be tested without a model against a small stub `http.server` that answers `/v1/chat/completions` with SSE (`data: {"choices":[{"delta":{"content":...}}]}` ... `data: [DONE]`); pass `--url http://127.0.0.1:<port>`.
 - server.py can be run without uWSGI for development: `PLAMO3_LLAMA_URL=http://127.0.0.1:<port> python3 plamo-3-translate-server.py 8080` (`PLAMO3_LLAMA_URL` takes `unix:<path>` or `http://host:port`; default is the installed socket)

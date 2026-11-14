@@ -22,6 +22,7 @@ readonly PLAMO3INS_UWSGI_UNIT="$PLAMO3INS_APP_NAME-uwsgi.service"
 readonly PLAMO3INS_UNIT_DIR="/etc/systemd/system"
 readonly PLAMO3INS_NGINX_SITE="/etc/nginx/sites-available/$PLAMO3INS_APP_NAME"
 readonly PLAMO3INS_NGINX_LINK="/etc/nginx/sites-enabled/$PLAMO3INS_APP_NAME"
+PLAMO3INS_NGINX_GROUP="www-data"  # group of the nginx workers; set by detect_nginx_group
 readonly PLAMO3INS_RUN_DIR="/run/$PLAMO3INS_APP_NAME"
 readonly PLAMO3INS_SOCKET="$PLAMO3INS_RUN_DIR/uwsgi.sock"
 # llama-server also listens on a UNIX socket for plamo-3-translate-server.py;
@@ -1109,7 +1110,7 @@ threads = 4
 need-app = true
 wsgi-file = $PLAMO3INS_d/app/$PLAMO3INS_SERVER_PY
 socket = $PLAMO3INS_SOCKET
-chown-socket = $PLAMO3INS_u:www-data
+chown-socket = $PLAMO3INS_u:$PLAMO3INS_NGINX_GROUP
 chmod-socket = 660
 vacuum = true
 die-on-term = true
@@ -1133,7 +1134,7 @@ Type=notify
 NotifyAccess=all
 User=$PLAMO3INS_u
 Group=$PLAMO3INS_u
-SupplementaryGroups=www-data
+SupplementaryGroups=$PLAMO3INS_NGINX_GROUP
 RuntimeDirectory=$PLAMO3INS_APP_NAME
 RuntimeDirectoryMode=0755
 EnvironmentFile=-$PLAMO3INS_ENV_FILE
@@ -1152,8 +1153,35 @@ EOF
   chmod 0644 "$PLAMO3INS_UNIT_DIR/$PLAMO3INS_LLAMA_UNIT" "$PLAMO3INS_UNIT_DIR/$PLAMO3INS_UWSGI_UNIT" "$PLAMO3INS_UWSGI_INI"
 }
 
+# nginx is shared with other sites: nginx.conf is not touched, so find out which group
+# its workers run in ("user USER [GROUP];", GROUP defaults to USER) and give that group
+# access to the uWSGI socket.  Sets PLAMO3INS_NGINX_GROUP.
+detect_nginx_group() {
+  local PLAMO3INS_conf PLAMO3INS_line PLAMO3INS_user="" PLAMO3INS_group="" PLAMO3INS_rest=""
+  # nginx -T fails if the configuration is invalid (e.g. a stale address in our old site).
+  PLAMO3INS_conf=$(nginx -T 2>/dev/null) || PLAMO3INS_conf=$(cat /etc/nginx/nginx.conf 2>/dev/null) || PLAMO3INS_conf=""
+  PLAMO3INS_line=$(sed -n 's/^[[:space:]]*user[[:space:]]\+\([^;#]*\);.*/\1/p;T;q' <<<"$PLAMO3INS_conf")
+  read -r PLAMO3INS_user PLAMO3INS_group PLAMO3INS_rest <<<"$PLAMO3INS_line" || true
+  if [[ -z $PLAMO3INS_user ]]; then
+    warn "could not find the \"user\" directive of nginx; assuming group $PLAMO3INS_NGINX_GROUP"
+    return 0
+  fi
+  PLAMO3INS_NGINX_GROUP=${PLAMO3INS_group:-$PLAMO3INS_user}
+  getent group "$PLAMO3INS_NGINX_GROUP" >/dev/null \
+    || die "nginx is configured to run in group $PLAMO3INS_NGINX_GROUP, which does not exist (see the \"user\" directive in /etc/nginx/nginx.conf)"
+  [[ $PLAMO3INS_NGINX_GROUP == www-data ]] || info "nginx runs in group $PLAMO3INS_NGINX_GROUP; the uWSGI socket is made accessible to it"
+}
+
+# Only our own site file is written.  If nginx rejects the result, the previous state is
+# restored, so that a broken site of ours never blocks reloads for the other sites.
 write_nginx() {
   local PLAMO3INS_listen="" PLAMO3INS_a PLAMO3INS_port=${PLAMO3INS_VAL[WEB_PORT]}
+  local PLAMO3INS_backup="" PLAMO3INS_had_link=no PLAMO3INS_out
+  [[ -e $PLAMO3INS_NGINX_LINK || -L $PLAMO3INS_NGINX_LINK ]] && PLAMO3INS_had_link=yes
+  if [[ -f $PLAMO3INS_NGINX_SITE ]]; then
+    PLAMO3INS_backup=$(mktemp "$PLAMO3INS_NGINX_SITE.XXXXXX")
+    cp -p "$PLAMO3INS_NGINX_SITE" "$PLAMO3INS_backup"
+  fi
   if [[ ${PLAMO3INS_VAL[INTERFACES]} == all ]]; then
     PLAMO3INS_listen="    listen $PLAMO3INS_port;"$'\n'"    listen [::]:$PLAMO3INS_port;"
   else
@@ -1183,22 +1211,46 @@ $PLAMO3INS_listen
 }
 EOF
   ln -sfn "$PLAMO3INS_NGINX_SITE" "$PLAMO3INS_NGINX_LINK"
-  nginx -t 2>&1 || die "nginx configuration test failed"
+  if PLAMO3INS_out=$(nginx -t 2>&1); then
+    [[ -z $PLAMO3INS_backup ]] || rm -f "$PLAMO3INS_backup"
+    return 0
+  fi
+  printf '%s\n' "$PLAMO3INS_out" >&2
+  if [[ -n $PLAMO3INS_backup ]]; then
+    mv -f "$PLAMO3INS_backup" "$PLAMO3INS_NGINX_SITE"
+  else
+    rm -f "$PLAMO3INS_NGINX_SITE"
+  fi
+  [[ $PLAMO3INS_had_link == yes ]] || rm -f "$PLAMO3INS_NGINX_LINK"
+  if nginx -t >/dev/null 2>&1; then
+    die "nginx rejected the new site configuration (see above); the previous nginx configuration was restored"
+  fi
+  die "nginx configuration test failed (see above), also without the changes of this installer; fix the nginx configuration and re-run"
 }
 
 start_services() {
   info "Starting services"
   systemctl daemon-reload
-  systemctl enable "$PLAMO3INS_LLAMA_UNIT" "$PLAMO3INS_UWSGI_UNIT" nginx.service
+  systemctl enable "$PLAMO3INS_LLAMA_UNIT" "$PLAMO3INS_UWSGI_UNIT"
   systemctl restart "$PLAMO3INS_LLAMA_UNIT"
   systemctl restart "$PLAMO3INS_UWSGI_UNIT" || {
     journalctl -u "$PLAMO3INS_UWSGI_UNIT" -n 30 --no-pager >&2 || true
     die "failed to start $PLAMO3INS_UWSGI_UNIT"
   }
+  # nginx is shared with other sites: reload instead of restart, and change its state
+  # (enabled / running) only when needed, telling the administrator about it.
+  if ! systemctl is-enabled --quiet nginx.service 2>/dev/null; then
+    warn "nginx.service was not enabled; enabling it (it will serve all enabled sites at boot)"
+    systemctl enable nginx.service
+  fi
   if systemctl is-active --quiet nginx.service; then
     systemctl reload nginx.service
   else
-    systemctl start nginx.service
+    warn "nginx.service was not running; starting it (it serves all enabled sites)"
+    systemctl start nginx.service || {
+      journalctl -u nginx.service -n 30 --no-pager >&2 || true
+      die "failed to start nginx.service"
+    }
   fi
 }
 
@@ -1476,6 +1528,7 @@ do_install() {
   install_model
   install_app
   write_env_file
+  detect_nginx_group
   write_units
   write_nginx
   [[ -n ${PLAMO3INS_SAVED[DESTDIR]:-} && ${PLAMO3INS_SAVED[DESTDIR]} != "${PLAMO3INS_VAL[DESTDIR]}" ]] \

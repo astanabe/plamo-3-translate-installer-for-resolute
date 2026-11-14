@@ -55,6 +55,18 @@ GPU selection: when the selected backend can use two or more GPUs (NVIDIA for CU
 
 Network interfaces: when two or more network interfaces have global addresses (container/VM bridges such as `docker0`, `virbr0` and `lxdbr0` are ignored), the installer asks on which of them the web server (and llama-server if exposed) accept connections from other hosts (`all` or numbers). With selected interfaces, nginx and llama-server listen on their current addresses plus `127.0.0.1` (and `::1` for nginx), and the ufw rules are limited to them (`ufw allow in on IF to any port PORT proto tcp`). The interface names are saved and the addresses are looked up at installation, so re-run the installer if an address changes. Rules added by an earlier run that are no longer wanted (e.g. a rule for all interfaces) are removed.
 
+### Sharing nginx with other sites
+
+The installer uses the system nginx (`nginx.service` from apt) and shares it with whatever else runs on the machine, e.g. unrelated sites on ports 80/443 or a reverse proxy for another application:
+
+- It writes only its own site file (`/etc/nginx/sites-available/plamo-3-translate` and the link in `sites-enabled`). `nginx.conf`, `conf.d`, the `default` site and other sites are not touched, and all its settings (body limit, timeouts) are inside its own `server` block, which listens only on the web server port and is not a `default_server`.
+- nginx keeps running as its own user (`www-data` on Ubuntu), not as the service user. The uWSGI socket is owned by the service user and the group of the nginx workers (mode 0660); the group is taken from the `user` directive of the nginx configuration at installation, so re-run the installer if you change that directive.
+- nginx is reloaded, not restarted, so connections of other sites are kept. If nginx was disabled or stopped, the installer enables/starts it and says so (nginx then serves all enabled sites).
+- If nginx rejects the configuration, the installer restores the previous site file (or removes the new one) and stops, so that reloads for the other sites keep working. It also tells whether the configuration was already invalid without its changes.
+- `--uninstall` removes only its own site and reloads nginx.
+
+On a machine without nginx, apt also enables nginx's `default` site (port 80, "Welcome to nginx!"); the installer leaves it as it is.
+
 ### Files
 
 ```
@@ -70,7 +82,7 @@ Network interfaces: when two or more network interfaces have global addresses (c
 /etc/systemd/system/
   plamo-3-translate-llama.service           llama-server (TCP port and socket /run/plamo-3-translate-llama/llama.sock)
   plamo-3-translate-uwsgi.service           uWSGI (socket /run/plamo-3-translate/uwsgi.sock)
-/etc/nginx/sites-available/plamo-3-translate (linked from sites-enabled)
+/etc/nginx/sites-available/plamo-3-translate (linked from sites-enabled; the only file written under /etc/nginx)
 ```
 
 Downloads are verified with SHA-256 checksums built into the installer (llama.cpp release assets and pinned Hugging Face revisions of the GGUF files).
@@ -130,7 +142,7 @@ web browser ──→ nginx-full (TCP 18080) ──→ uWSGI ──→ plamo-3-t
 plamo-3-translate-client.py ──────────────── TCP 28080 ──────────────────→ llama-server
 ```
 
-- Web server (TCP 18080 by default) (nginx-full)
+- Web server (TCP 18080 by default) (nginx-full; the system nginx running as `www-data`, shared with other sites)
   - uWSGI (`uwsgi`, `uwsgi-plugin-python3` from apt)
     - plamo-3-translate-server.py (provided in this repository)
       - `GET /` : translation form (HTML). On PCs, Source text and Translation are side by side, surrounded by four Translate buttons that follow the textarea size; on phones (width below 760px), selectors, Source text, a Translate/Clear button and Translation are stacked, sized so that each screen ends at the button / at the title. The translation appears as it is generated. On PCs the status line shows the progress (prompt processing in percent, then the number of characters generated); phones have no status line, to give its height to Translation: the button shows the progress, and only errors appear below the form. Both textareas have a Copy button, and the model size and quantization reported by llama-server are shown.
@@ -204,5 +216,5 @@ echo 'こんにちは' | ./plamo-3-translate-client.py -    # standard input -> 
 3. Install dependencies via apt
 4. Create the service user if needed
 5. Download and install llama.cpp and GGUF file
-6. Generate and install systemd unit files and nginx site configuration, and start and enable servers (open the ports in ufw as answered in step 1; if ufw became active after step 1, ask here)
+6. Generate and install systemd unit files and nginx site configuration (rolled back if nginx rejects it), start and enable servers, and reload nginx (open the ports in ufw as answered in step 1; if ufw became active after step 1, ask here)
 7. Test llama-server (`/health`) and translate a short sentence through the web server, checking that a non-empty result is returned
