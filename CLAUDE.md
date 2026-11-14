@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-`install-plamo-3-translate.sh` and `plamo-3-translate-server.py` are implemented; `plamo-3-translate-client.py` is not yet. `README.md` is the source of truth for behavior, options, defaults, file layout and procedure — keep it in sync when the implementation changes.
+`install-plamo-3-translate.sh`, `plamo-3-translate-server.py` and `plamo-3-translate-client.py` are implemented. `README.md` is the source of truth for behavior, options, defaults, file layout and procedure — keep it in sync when the implementation changes.
 
-Pinned data lives at the top of the installer: llama.cpp asset names/SHA-256/sizes (`PLAMO3INS_LLAMA_ASSETS`), Hugging Face revisions (`PLAMO3INS_MODEL_REVISION`) and GGUF SHA-256/sizes (`PLAMO3INS_GGUF`). Update them together when bumping llama.cpp or a model.
+Pinned data lives at the top of the installer: llama.cpp asset names/SHA-256/sizes (`PLAMO3INS_LLAMA_ASSETS`), Hugging Face revisions (`PLAMO3INS_MODEL_REVISION`) and GGUF SHA-256/sizes (`PLAMO3INS_GGUF`). Update them together when bumping llama.cpp or a model. `PLAMO3INS_CLIENT_CHUNK_CHARS` / `PLAMO3INS_CLIENT_CTX` mirror the client's `DEFAULT_CHUNK_CHARS` / `HISTORY_FACTOR` (the installer warns at the end when the actual context is below `PLAMO3INS_CLIENT_CTX`); update them when changing the client defaults.
 
 Every shell variable in the installer — globals, arrays and `local`s — is prefixed with `PLAMO3INS_` to avoid clashes (e.g. with `/etc/os-release` or the environment). Exceptions: bash builtins (`BASH_REMATCH`, `EUID`, `SECONDS`, ...), the user-facing `PLAMO3_*` environment variables, `DEBIAN_FRONTEND`, and the key names inside `install.conf` and associative arrays (`DESTDIR`, `UFW_PORTS`, ...). Do not source external files into the installer's shell.
 
@@ -14,11 +14,11 @@ Every shell variable in the installer — globals, arrays and `local`s — is pr
 
 A bash installer that sets up a PLaMo 3 Translate web service on **Ubuntu 26.04 LTS (Resolute Raccoon)**, x86_64, Server or Desktop (tested on Server; WSL not supported). Entry point: `bash install-plamo-3-translate.sh`.
 
-## Planned deliverables
+## Deliverables
 
 - `install-plamo-3-translate.sh` — installer (interactive, non-interactive via options/env vars, `--uninstall`; re-runnable in place)
 - `plamo-3-translate-server.py` — WSGI app under uWSGI: `GET /` HTML form, `POST /api/translate` JSON API, calls llama-server
-- `plamo-3-translate-client.py` — CLI client that talks to llama-server directly (TCP 28080 default)
+- `plamo-3-translate-client.py` — CLI client that talks to llama-server directly (TCP 28080 default): translates a text/Markdown file or stdin keeping its layout, in chunks with translation history. Not installed by the installer; used from the repository. It copies the language list, auto-target detection, request payload and SSE parsing from server.py (no import: server.py is deployed as a single file) — keep both in sync.
 
 ## Architecture (request path)
 
@@ -60,29 +60,13 @@ All services are systemd units running as the install-time user (default `plamo3
 
 No test suite exists yet. End-to-end verification is step 7 of the installer itself.
 
-- Static checks: `shellcheck install-plamo-3-translate.sh`, `bash -n`, `python3 -m py_compile plamo-3-translate-server.py`
+- Static checks: `shellcheck install-plamo-3-translate.sh`, `bash -n`, `python3 -m py_compile plamo-3-translate-server.py plamo-3-translate-client.py`
+- The client can be tested without a model against a small stub `http.server` that answers `/v1/chat/completions` with SSE (`data: {"choices":[{"delta":{"content":...}}]}` ... `data: [DONE]`); pass `--url http://127.0.0.1:<port>`.
 - server.py can be run without uWSGI for development: `PLAMO3_LLAMA_URL=http://127.0.0.1:<port> python3 plamo-3-translate-server.py 8080` (`PLAMO3_LLAMA_URL` takes `unix:<path>` or `http://host:port`; default is the installed socket)
 - Vulkan, CUDA and ROCm backends are untested (no supported GPU in the development machine).
 
 ## TODO (handover for the next session)
 
-### Implement `plamo-3-translate-client.py`
-
-The only remaining deliverable. README already refers to it (Architecture, Client, License) — update README when it is implemented.
-
-Agreed so far:
-- CLI client that talks to **llama-server directly over TCP** (default `http://127.0.0.1:28080`), not to the web server. The TCP port exists for this client; the web server uses the UNIX socket.
-- Python standard library only (`urllib`/`http.client`, `json`, `argparse`); no pip.
-- Request format is the same as `plamo-3-translate-server.py` → `translate()`: `POST /v1/chat/completions` with `model: plamo-3-translate`, the source text as the last user message, settings in `chat_template_kwargs` (`target_lang`, `source_lang`, `form`, `glossary` as `[{source, target}]`, `context`), `temperature: 0`, `stop: ["<|plamo:tag|>", "<|plamo:bos|>"]`, bounded `max_tokens`. Validation and the 53-language list in server.py can be reused (copy; server.py is deployed as a single standalone file).
-- API key: required when llama-server is exposed (`Authorization: Bearer <key>`). The installer stores it in `/etc/plamo-3-translate/llama-server.env` (`LLAMA_API_KEY`, mode 0640 root:<service user>), which ordinary users cannot read, so the client needs its own way to get the key (option and/or environment variable).
-
-To decide with the user before implementing:
-- CLI interface: input from arguments / stdin / files, output format, option names (e.g. `--to`, `--from`, `--form`, `--glossary FILE`, `--context`), and environment variable names (follow the `PLAMO3_` prefix).
-- Whether the installer should also install the client (e.g. into `<destdir>/app/` or `/usr/local/bin`) or it is only used from this repository.
-- Whether to support long documents (splitting into paragraphs and passing previous pairs as translation history, as the model card describes) or translate the input in one request.
-
-Verification: `python3 -m py_compile`, then against an installed llama-server, both local (`127.0.0.1`) and exposed (API key required; a request without it must fail with a clear message).
-
-### Other open items
+### Open items
 
 - Real-hardware tests of the GPU backends (Vulkan, CUDA, ROCm) and of multi-GPU selection; in particular the ROCm index order (KFD topology) and the Vulkan PCI addresses (`VK_EXT_pci_bus_info`) are untested.

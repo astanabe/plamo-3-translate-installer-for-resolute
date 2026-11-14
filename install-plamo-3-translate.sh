@@ -92,6 +92,12 @@ readonly PLAMO3INS_NATIVE_CTX=262144
 # KV cache bytes per context token: full-attention layers (1 in 8) x 2 (K, V) x KV heads x 128 x 2 bytes (f16).
 # The sliding-window layers use a small fixed-size cache.  Measured with llama.cpp b12366.
 declare -A PLAMO3INS_KV_BYTES=([0.8b]=1024 [2b]=6144 [8b]=8192 [31b]=32768)
+# Context (tokens) that one request of plamo-3-translate-client.py with its defaults can
+# need for long Japanese/English documents: chunk (DEFAULT_CHUNK_CHARS 20000 characters) +
+# history (HISTORY_FACTOR 2.5 x 20000) + translation (~ the chunk), at ~0.4 tokens per
+# character (Japanese; English is ~0.16), plus a margin.  Keep in sync with the client.
+readonly PLAMO3INS_CLIENT_CHUNK_CHARS=20000
+readonly PLAMO3INS_CLIENT_CTX=40000
 # Seconds to wait for llama-server to load the model.
 declare -A PLAMO3INS_HEALTH_TIMEOUT=([0.8b]=180 [2b]=300 [8b]=900 [31b]=1800)
 
@@ -1434,6 +1440,22 @@ EOF
 EOF
   fi
   echo
+  warn_small_context
+}
+
+# Warn when the context is too small for plamo-3-translate-client.py with its defaults.
+warn_small_context() {
+  local PLAMO3INS_chunk
+  [[ $PLAMO3INS_N_CTX =~ ^[0-9]+$ ]] && ((PLAMO3INS_N_CTX < PLAMO3INS_CLIENT_CTX)) || return 0
+  PLAMO3INS_chunk=$((PLAMO3INS_N_CTX * PLAMO3INS_CLIENT_CHUNK_CHARS / PLAMO3INS_CLIENT_CTX / 100 * 100))
+  ((PLAMO3INS_chunk >= 100)) || PLAMO3INS_chunk=100
+  warn "the context size ($PLAMO3INS_N_CTX tokens) is smaller than plamo-3-translate-client.py may need for long documents with its default --chunk-chars $PLAMO3INS_CLIENT_CHUNK_CHARS (about $PLAMO3INS_CLIENT_CTX tokens); requests may fail. Use --chunk-chars $PLAMO3INS_chunk or less with the client."
+  if [[ ${PLAMO3INS_VAL[CTX_SIZE]} == auto ]]; then
+    warn "llama.cpp reduced the context to fit the memory; a smaller model or quantization, or more GPU memory, gives a larger context."
+  else
+    warn "the context size was set with --ctx-size ${PLAMO3INS_VAL[CTX_SIZE]}; re-run the installer with --ctx-size auto or a larger value for a larger context."
+  fi
+  echo >&2
 }
 
 do_install() {

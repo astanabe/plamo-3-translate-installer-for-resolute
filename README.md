@@ -111,7 +111,7 @@ Personal and non-commercial use is free. Commercial use requires registration wi
   - ROCm (`llama-b12366-bin-ubuntu-rocm-10.0-x64`)
 - The installer detects available GPUs and suggests a default backend.
 - llama-server options: `--jinja --no-prefill-assistant --alias plamo-3-translate`, plus `-c N` when a context size is given
-- Context size: by default (`auto`) `-c` is omitted, so llama-server uses the model maximum (262144 tokens for all sizes) and, with its `--fit` feature, reduces the context (down to 4096) when it does not fit in the memory. The actual size is shown at the end of the installation. An explicit `--ctx-size N` (512–262144) is used as is.
+- Context size: by default (`auto`) `-c` is omitted, so llama-server uses the model maximum (262144 tokens for all sizes) and, with its `--fit` feature, reduces the context (down to 4096) when it does not fit in the memory. The actual size is shown at the end of the installation, with a warning if it is smaller than about 40000 tokens, which plamo-3-translate-client.py may need for long documents with its default `--chunk-chars 20000` (the warning suggests a `--chunk-chars` value that fits). An explicit `--ctx-size N` (512–262144) is used as is.
 - Memory for the full 262144-token context (Q4_K_M, model + KV cache + buffers, approximate): 0.8B 2.1 GB, 2B 4.5 GB, 8B 8.2 GB, 31B 28 GB. Only one layer in eight attends to the whole context, so the KV cache is small for this context length.
 
 ## Quantization
@@ -153,6 +153,48 @@ plamo-3-translate-client.py ──────────────── TCP
 
 - Web browser (web server, TCP 18080)
 - plamo-3-translate-client.py (provided in this repository; connects to llama-server, TCP 28080)
+
+### plamo-3-translate-client.py
+
+A command-line client that translates a plain text or Markdown file (or standard input) through llama-server, keeping the layout of the document. It uses the Python standard library only and is not installed by the installer: run it from a checkout of this repository, on the server or on any host that can reach the llama-server port (`--expose-llama`).
+
+```
+./plamo-3-translate-client.py doc.md                  # -> doc.en.md (or doc.ja.md)
+./plamo-3-translate-client.py --to en -o out.txt in.txt
+echo 'こんにちは' | ./plamo-3-translate-client.py -    # standard input -> standard output
+```
+
+| Option | Default |
+|---|---|
+| `INPUT` | file to translate, or `-` for standard input |
+| `-o`, `--output PATH` | output file, or `-` for standard output. Default: for a file, an automatically named file (see below); for standard input, standard output |
+| `-f`, `--force` | overwrite an existing output file (without it, an existing output file is an error) |
+| `--from LANG` | detected (Japanese preferred, as in the web form) |
+| `--to LANG\|auto` | `auto`: Japanese to English, anything else to Japanese (decided once for the whole document) |
+| `--form plain\|polite` | style of Japanese translations (target `ja` only; ignored when `auto` gives another language) |
+| `--format auto\|text\|markdown` | `auto`: `markdown` for `.md` and `.markdown` files, `text` otherwise (also for standard input) |
+| `--glossary FILE` | one `source => target` per line (blank lines and lines starting with `#` are ignored; up to 500 entries) |
+| `--context TEXT` / `--context-file FILE` | background information about the document passed to the model |
+| `--chunk-chars N` | `20000`: maximum source characters per request |
+| `--url URL` | `$PLAMO3_LLAMA_URL`, or `http://127.0.0.1:28080` (`http://` only) |
+| `--api-key-file FILE` | the API key is taken from `$PLAMO3_LLAMA_API_KEY` |
+| `-q`, `--quiet` | no progress output (warnings and errors are still shown) |
+| `--list-languages` | print the language codes and exit |
+
+- Output file names: `dir/stem.ext` becomes `dir/stem.<target>.ext` (`README` → `README.en`, `doc.md` → `doc.zh-hans.md`). A language code at the end of the stem is replaced when it matches the source language (`--from`, or `ja`/`en` as detected): `doc.ja.md` → `doc.en.md`, but an English `report.id.txt` → `report.id.ja.txt`. The output is written to a temporary file in the same directory and renamed when the translation is complete; on an error or Ctrl-C nothing is left behind. The input file itself is never overwritten.
+- Input must be UTF-8. A BOM and CRLF line ends are kept in the output.
+- Markdown: front matter (`---` or `+++` at the beginning), fenced code blocks (```` ``` ```` / `~~~`), HTML blocks (from a line starting with a tag or comment to the next blank line), link reference definitions (`[label]: url`) and `$$` math blocks are copied unchanged; everything else (headings, lists, tables, quotes, ...) is translated with its markup. Indented code blocks are not recognized (they cannot be told apart from list continuation lines with a line-based parser) and are translated.
+- Long documents are split into chunks of at most `--chunk-chars` characters: paragraphs (separated by blank lines) are packed together; a paragraph longer than that is split between lines, keeping a Markdown table (consecutive lines starting with `|`) in one piece. Lines are never split: a line or table longer than `--chunk-chars` is sent alone with a warning. Blank lines and the whitespace around each chunk are kept as in the source. Each request carries the preceding source/translation pairs (source and translation, up to 2.5 × `--chunk-chars` characters in all) as translation history, as described in the model card, so that terms and style stay consistent. With the defaults, a request of a long Japanese or English document can need about 40000 tokens of context (the tokenizer uses about 0.4 tokens per Japanese character and 0.16 per English character; Chinese, Korean and some other scripts use 0.8 or more, so they need more). Lower `--chunk-chars` if llama-server reports that the request does not fit in its context; the installer warns when the context is smaller than that.
+- Progress goes to standard error: the chunk number and the prompt processing percentage, then, when writing to a file, the translation as it is generated; when writing to standard output, only the number of characters generated, and each chunk is written to standard output as soon as it is translated.
+- If llama-server stops a translation at the token limit (`finish_reason` `"length"`: the context is full, or the output reached the limit of 4 tokens per source character, e.g. because the model kept repeating itself), the client stops with an error instead of writing a truncated translation, and advises a smaller `--chunk-chars` (which also shortens the history) or breaking up a very long line or table.
+- Exit status: 0 success, 1 translation error (connection, API key, llama-server error), 2 invalid arguments or input, 130 interrupted.
+- API key: when llama-server is exposed, every request needs the key the installer generated, which is stored in `/etc/plamo-3-translate/llama-server.env` (readable by root and the service user only). Copy it into a file of your own and pass it with `--api-key-file` (or set `PLAMO3_LLAMA_API_KEY`):
+  ```
+  sudo sed -n 's/^LLAMA_API_KEY=//p' /etc/plamo-3-translate/llama-server.env > ~/.plamo3-key
+  chmod 600 ~/.plamo3-key
+  ./plamo-3-translate-client.py --api-key-file ~/.plamo3-key doc.md
+  ```
+  Without a key (or with a wrong one) the client stops with an explanation of how to give it.
 
 ## Procedure
 
