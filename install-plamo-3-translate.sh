@@ -103,10 +103,11 @@ readonly PLAMO3INS_CLIENT_CTX=40000
 declare -A PLAMO3INS_HEALTH_TIMEOUT=([0.8b]=180 [2b]=300 [8b]=900 [31b]=1800)
 
 # Settings: KEY -> default.  Values come from options > environment > install.conf > default.
+# GPUS: empty = choose one GPU automatically (see gpu_ranked).
 readonly PLAMO3INS_KEYS="DESTDIR USER MODEL QUANT BACKEND GPUS CTX_SIZE WEB_PORT LLAMA_PORT EXPOSE_LLAMA INTERFACES"
 declare -A PLAMO3INS_DEFAULT=(
   [DESTDIR]=/opt/plamo-3-translate [USER]=plamo3 [MODEL]=2b [QUANT]=Q4_K_M [BACKEND]=""
-  [GPUS]=all [CTX_SIZE]=auto [WEB_PORT]=18080 [LLAMA_PORT]=28080 [EXPOSE_LLAMA]=no [INTERFACES]=all
+  [GPUS]="" [CTX_SIZE]=auto [WEB_PORT]=18080 [LLAMA_PORT]=28080 [EXPOSE_LLAMA]=no [INTERFACES]=all
 )
 declare -A PLAMO3INS_ARG=() PLAMO3INS_VAL=() PLAMO3INS_SAVED=() PLAMO3INS_FROM_USER=()
 PLAMO3INS_ACTION=install
@@ -140,9 +141,9 @@ Options (environment variable in brackets):
                            [PLAMO3_QUANT] (default ${PLAMO3INS_DEFAULT[QUANT]})
   --backend NAME           cpu, vulkan, cuda12, cuda13 or rocm [PLAMO3_BACKEND]
                            (default: suggested from the detected GPU)
-  --gpus all|PCI[,PCI...]  GPUs used by llama-server, by PCI address such as
-                           0000:03:00.0 [PLAMO3_GPUS] (default all; asked when the
-                           backend sees two or more GPUs)
+  --gpus PCI[,PCI...]|all  GPUs used by llama-server, by PCI address such as
+                           0000:03:00.0 [PLAMO3_GPUS] (default: one GPU, the one with
+                           the most free memory; asked when the backend sees two or more)
   --ctx-size N|auto        llama-server context size [PLAMO3_CTX_SIZE] (default auto: the model
                            maximum $PLAMO3INS_NATIVE_CTX, reduced by llama.cpp to fit the memory)
   --web-port PORT          web server port [PLAMO3_WEB_PORT] (default ${PLAMO3INS_DEFAULT[WEB_PORT]})
@@ -342,9 +343,27 @@ normalize_pci() {
   printf '%04x:%s\n' "$((16#${BASH_REMATCH[1]}))" "${BASH_REMATCH[2]}"
 }
 
-# Print "PCI address<TAB>description" for the GPUs the selected backend can use.
+# Print "PCI address<TAB>MiB" for the GPU memory the installed llama-server uses now, so
+# that a re-run does not count it as memory in use (NVIDIA only).
+own_gpu_usage() {
+  local PLAMO3INS_pid PLAMO3INS_out PLAMO3INS_p PLAMO3INS_mib PLAMO3INS_bus
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+  PLAMO3INS_pid=$(systemctl show -p MainPID --value "$PLAMO3INS_LLAMA_UNIT" 2>/dev/null || true)
+  [[ $PLAMO3INS_pid =~ ^[1-9][0-9]*$ ]] || return 0
+  PLAMO3INS_out=$(nvidia-smi --query-compute-apps=pid,used_memory,gpu_bus_id --format=csv,noheader,nounits 2>/dev/null) || return 0
+  while IFS=', ' read -r PLAMO3INS_p PLAMO3INS_mib PLAMO3INS_bus; do
+    if [[ $PLAMO3INS_p == "$PLAMO3INS_pid" && $PLAMO3INS_mib =~ ^[0-9]+$ ]]; then
+      printf '%s\t%s\n' "$(normalize_pci "$PLAMO3INS_bus")" "$PLAMO3INS_mib"
+    fi
+  done <<<"$PLAMO3INS_out"
+  return 0
+}
+
+# Print "PCI address<TAB>maker<TAB>total bytes<TAB>used bytes<TAB>name" for the GPUs the
+# selected backend can use (0 bytes: unknown).  "used" does not count the installed
+# llama-server.
 gpu_devices() {
-  local PLAMO3INS_vendors PLAMO3INS_dev PLAMO3INS_pci PLAMO3INS_vendor PLAMO3INS_name PLAMO3INS_mem PLAMO3INS_mem_mib PLAMO3INS_smi="" PLAMO3INS_line
+  local PLAMO3INS_vendors PLAMO3INS_dev PLAMO3INS_pci PLAMO3INS_vendor PLAMO3INS_maker PLAMO3INS_name PLAMO3INS_total PLAMO3INS_used PLAMO3INS_smi="" PLAMO3INS_own="" PLAMO3INS_bus PLAMO3INS_t PLAMO3INS_u
   case ${PLAMO3INS_VAL[BACKEND]} in
     cuda12|cuda13) PLAMO3INS_vendors="0x10de" ;;
     rocm) PLAMO3INS_vendors="0x1002" ;;
@@ -352,28 +371,68 @@ gpu_devices() {
     *) return 0 ;;
   esac
   if command -v nvidia-smi >/dev/null 2>&1; then
-    PLAMO3INS_smi=$(nvidia-smi --query-gpu=pci.bus_id,memory.total --format=csv,noheader,nounits 2>/dev/null || true)
+    PLAMO3INS_smi=$(nvidia-smi --query-gpu=pci.bus_id,memory.total,memory.used --format=csv,noheader,nounits 2>/dev/null || true)
+    PLAMO3INS_own=$(own_gpu_usage)
   fi
   for PLAMO3INS_dev in /sys/bus/pci/devices/*; do
     [[ -r $PLAMO3INS_dev/class && -r $PLAMO3INS_dev/vendor ]] || continue
     [[ $(<"$PLAMO3INS_dev/class") == 0x03* ]] || continue
     PLAMO3INS_vendor=$(<"$PLAMO3INS_dev/vendor")
     [[ " $PLAMO3INS_vendors " == *" $PLAMO3INS_vendor "* ]] || continue
+    case $PLAMO3INS_vendor in
+      0x10de) PLAMO3INS_maker=nvidia ;;
+      0x1002) PLAMO3INS_maker=amd ;;
+      *) PLAMO3INS_maker=intel ;;
+    esac
     PLAMO3INS_pci=$(basename "$PLAMO3INS_dev")
     PLAMO3INS_name=""
     command -v lspci >/dev/null 2>&1 && PLAMO3INS_name=$(lspci -vmm -s "$PLAMO3INS_pci" 2>/dev/null | sed -n 's/^Device:[[:space:]]*//p;T;q' || true)
     [[ -n $PLAMO3INS_name ]] || PLAMO3INS_name="${PLAMO3INS_vendor#0x}:$(sed 's/^0x//' "$PLAMO3INS_dev/device")"
-    PLAMO3INS_mem=""
+    PLAMO3INS_total=0; PLAMO3INS_used=0
     if [[ -r $PLAMO3INS_dev/mem_info_vram_total ]]; then
-      PLAMO3INS_mem=$(human "$(<"$PLAMO3INS_dev/mem_info_vram_total")")
+      PLAMO3INS_total=$(cat "$PLAMO3INS_dev/mem_info_vram_total" 2>/dev/null || echo 0)
+      PLAMO3INS_used=$(cat "$PLAMO3INS_dev/mem_info_vram_used" 2>/dev/null || echo 0)
+      [[ $PLAMO3INS_total =~ ^[0-9]+$ ]] || PLAMO3INS_total=0
+      [[ $PLAMO3INS_used =~ ^[0-9]+$ ]] || PLAMO3INS_used=0
     else
-      while IFS=', ' read -r PLAMO3INS_line PLAMO3INS_mem_mib; do
-        [[ $(normalize_pci "$PLAMO3INS_line") == "$PLAMO3INS_pci" && $PLAMO3INS_mem_mib =~ ^[0-9]+$ ]] \
-          && PLAMO3INS_mem=$(human $((PLAMO3INS_mem_mib * 1024 * 1024)))
+      while IFS=', ' read -r PLAMO3INS_bus PLAMO3INS_t PLAMO3INS_u; do
+        [[ $(normalize_pci "$PLAMO3INS_bus") == "$PLAMO3INS_pci" && $PLAMO3INS_t =~ ^[0-9]+$ ]] || continue
+        PLAMO3INS_total=$((PLAMO3INS_t * 1024 * 1024))
+        if [[ $PLAMO3INS_u =~ ^[0-9]+$ ]]; then PLAMO3INS_used=$((PLAMO3INS_u * 1024 * 1024)); fi
       done <<<"$PLAMO3INS_smi"
+      while IFS=$'\t' read -r PLAMO3INS_bus PLAMO3INS_u; do
+        if [[ $PLAMO3INS_bus == "$PLAMO3INS_pci" ]]; then PLAMO3INS_used=$((PLAMO3INS_used - PLAMO3INS_u * 1024 * 1024)); fi
+      done <<<"$PLAMO3INS_own"
+      ((PLAMO3INS_used >= 0)) || PLAMO3INS_used=0
     fi
-    printf '%s\t%s%s\n' "$PLAMO3INS_pci" "$PLAMO3INS_name" "${PLAMO3INS_mem:+ ($PLAMO3INS_mem)}"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$PLAMO3INS_pci" "$PLAMO3INS_maker" "$PLAMO3INS_total" "$PLAMO3INS_used" "$PLAMO3INS_name"
   done
+}
+
+# gpu_ranked DEVICES: sort the gpu_devices lines by preference: NVIDIA, AMD, then Intel;
+# then the most free memory, then the largest memory, then the PCI address.
+gpu_ranked() {
+  [[ -n $1 ]] || return 0
+  awk -F '\t' -v OFS='\t' '{print ($2 == "nvidia" ? 0 : $2 == "amd" ? 1 : 2), $3 - $4, $0}' <<<"$1" \
+    | LC_ALL=C sort -t $'\t' -k1,1n -k2,2nr -k5,5nr -k3,3 | cut -f3-
+}
+
+# gpu_free DEVICES [all]: print the free memory in bytes of the selected GPUs (of every
+# GPU with "all") and their number, separated by a space.
+gpu_free() {
+  awk -F '\t' -v sel=",${2:-${PLAMO3INS_VAL[GPUS]}}," '
+    sel == ",all," || index(sel, "," $1 ",") {free += $3 - $4; n++}
+    END {printf "%.0f %d\n", free, n}' <<<"$1"
+}
+
+# True if llama-server has to be limited to a part of the GPUs of the backend.
+gpus_restricted() {
+  local PLAMO3INS_pci
+  [[ ${PLAMO3INS_VAL[BACKEND]} != cpu && -n ${PLAMO3INS_VAL[GPUS]} && ${PLAMO3INS_VAL[GPUS]} != all ]] || return 1
+  while IFS=$'\t' read -r PLAMO3INS_pci _; do
+    [[ -z $PLAMO3INS_pci || ",${PLAMO3INS_VAL[GPUS]}," == *",$PLAMO3INS_pci,"* ]] || return 0
+  done <<<"$(gpu_devices)"
+  return 1
 }
 
 # Print "UUID<TAB>PCI address" for each NVIDIA GPU.
@@ -484,11 +543,12 @@ finally:
 PY
 }
 
-# Print the Environment= lines that restrict llama-server to the selected GPUs.
+# Print the Environment= lines that restrict llama-server to the selected GPUs (none when
+# every GPU of the backend is selected).
 gpu_environment() {
   local PLAMO3INS_b=${PLAMO3INS_VAL[BACKEND]} PLAMO3INS_map PLAMO3INS_p PLAMO3INS_id PLAMO3INS_var PLAMO3INS_ids=()
   case $PLAMO3INS_b in cuda12|cuda13) echo "Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID" ;; esac
-  [[ $PLAMO3INS_b != cpu && ${PLAMO3INS_VAL[GPUS]} != all ]] || return 0
+  gpus_restricted || return 0
   case $PLAMO3INS_b in
     cuda12|cuda13) PLAMO3INS_var=CUDA_VISIBLE_DEVICES; PLAMO3INS_map=$(cuda_devices) ;;
     rocm) PLAMO3INS_var=ROCR_VISIBLE_DEVICES; PLAMO3INS_map=$(rocm_devices) ;;
@@ -504,14 +564,19 @@ gpu_environment() {
 }
 
 gpu_label() {
-  local PLAMO3INS_n
+  local PLAMO3INS_list PLAMO3INS_pci PLAMO3INS_total PLAMO3INS_name PLAMO3INS_text=""
   [[ ${PLAMO3INS_VAL[BACKEND]} != cpu ]] || { echo "none (cpu backend)"; return 0; }
+  PLAMO3INS_list=$(gpu_devices)
   if [[ ${PLAMO3INS_VAL[GPUS]} == all ]]; then
-    PLAMO3INS_n=$(gpu_devices | grep -c . || true)
-    echo "all ($PLAMO3INS_n detected)"
-  else
-    echo "${PLAMO3INS_VAL[GPUS]//,/, }"
+    echo "all ($(grep -c . <<<"$PLAMO3INS_list" || true) detected)"
+    return 0
   fi
+  while IFS=$'\t' read -r PLAMO3INS_pci _ PLAMO3INS_total _ PLAMO3INS_name; do
+    [[ -n $PLAMO3INS_pci && ",${PLAMO3INS_VAL[GPUS]}," == *",$PLAMO3INS_pci,"* ]] || continue
+    PLAMO3INS_text+="${PLAMO3INS_text:+, }$PLAMO3INS_pci $PLAMO3INS_name"
+    ((PLAMO3INS_total == 0)) || PLAMO3INS_text+=" ($(human "$PLAMO3INS_total"))"
+  done <<<"$PLAMO3INS_list"
+  echo "${PLAMO3INS_text:-${PLAMO3INS_VAL[GPUS]//,/, }}"
 }
 
 # ------------------------------------------------------- network interfaces
@@ -683,14 +748,17 @@ validate() {
   validate_interfaces
 }
 
+# Check the GPU selection.  An empty selection (the default) becomes one GPU, the first of
+# gpu_ranked, or "all" when the installer cannot list the GPUs of the backend.
 validate_gpus() {
-  local PLAMO3INS_v=${PLAMO3INS_VAL[GPUS],,} PLAMO3INS_list PLAMO3INS_p PLAMO3INS_a PLAMO3INS_out=()
-  if [[ -z $PLAMO3INS_v || $PLAMO3INS_v == all ]]; then PLAMO3INS_VAL[GPUS]=all; return 0; fi
+  local PLAMO3INS_v=${PLAMO3INS_VAL[GPUS],,} PLAMO3INS_devs PLAMO3INS_list PLAMO3INS_p PLAMO3INS_a PLAMO3INS_out=()
   if [[ ${PLAMO3INS_VAL[BACKEND]} == cpu ]]; then
     [[ -z ${PLAMO3INS_FROM_USER[GPUS]:-} ]] || warn "--gpus is ignored with the cpu backend"
-    PLAMO3INS_VAL[GPUS]=all; return 0
+    PLAMO3INS_VAL[GPUS]=""; return 0
   fi
-  PLAMO3INS_list=$(gpu_devices | cut -f1)
+  if [[ $PLAMO3INS_v == all ]]; then PLAMO3INS_VAL[GPUS]=all; return 0; fi
+  PLAMO3INS_devs=$(gpu_devices)
+  PLAMO3INS_list=$(cut -f1 <<<"$PLAMO3INS_devs")
   for PLAMO3INS_p in ${PLAMO3INS_v//,/ }; do
     PLAMO3INS_a=$(normalize_pci "$PLAMO3INS_p")
     [[ -n $PLAMO3INS_a ]] || die "invalid PCI address in --gpus: $PLAMO3INS_p (use e.g. 0000:03:00.0, or all)"
@@ -698,27 +766,34 @@ validate_gpus() {
       if [[ -n ${PLAMO3INS_FROM_USER[GPUS]:-} ]]; then
         die "GPU $PLAMO3INS_a is not available for the ${PLAMO3INS_VAL[BACKEND]} backend (available: $(paste -sd' ' <<<"$PLAMO3INS_list"))"
       fi
-      warn "the saved GPU selection ($PLAMO3INS_v) does not match this machine; using all GPUs"
-      PLAMO3INS_VAL[GPUS]=all; return 0
+      warn "the saved GPU selection ($PLAMO3INS_v) does not match this machine; choosing a GPU again"
+      PLAMO3INS_out=(); break
     fi
     [[ " ${PLAMO3INS_out[*]} " == *" $PLAMO3INS_a "* ]] || PLAMO3INS_out+=("$PLAMO3INS_a")
   done
-  PLAMO3INS_VAL[GPUS]=$(IFS=,; echo "${PLAMO3INS_out[*]}")
+  if ((${#PLAMO3INS_out[@]} > 0)); then
+    PLAMO3INS_VAL[GPUS]=$(IFS=,; echo "${PLAMO3INS_out[*]}")
+  else
+    PLAMO3INS_VAL[GPUS]=$(gpu_ranked "$PLAMO3INS_devs" | sed -n '1p' | cut -f1)
+    [[ -n ${PLAMO3INS_VAL[GPUS]} ]] || PLAMO3INS_VAL[GPUS]=all
+  fi
 }
 
 # Ask which GPUs to use when the backend sees two or more.
 prompt_gpus() {
-  local PLAMO3INS_list PLAMO3INS_pcis=() PLAMO3INS_pci PLAMO3INS_desc PLAMO3INS_i PLAMO3INS_default="" PLAMO3INS_answer PLAMO3INS_tok PLAMO3INS_sel=() PLAMO3INS_ok
+  local PLAMO3INS_list PLAMO3INS_pcis=() PLAMO3INS_pci PLAMO3INS_maker PLAMO3INS_total PLAMO3INS_used PLAMO3INS_name PLAMO3INS_mem PLAMO3INS_i PLAMO3INS_default="" PLAMO3INS_answer PLAMO3INS_tok PLAMO3INS_sel=() PLAMO3INS_ok
   [[ ${PLAMO3INS_VAL[BACKEND]} != cpu && -z ${PLAMO3INS_FROM_USER[GPUS]:-} && $PLAMO3INS_INTERACTIVE == yes ]] || return 0
   PLAMO3INS_list=$(gpu_devices)
   [[ -n $PLAMO3INS_list ]] || return 0
-  while IFS=$'\t' read -r PLAMO3INS_pci PLAMO3INS_desc; do PLAMO3INS_pcis+=("$PLAMO3INS_pci"); done <<<"$PLAMO3INS_list"
+  while IFS=$'\t' read -r PLAMO3INS_pci _; do PLAMO3INS_pcis+=("$PLAMO3INS_pci"); done <<<"$PLAMO3INS_list"
   ((${#PLAMO3INS_pcis[@]} >= 2)) || return 0
   echo "GPUs available to the ${PLAMO3INS_VAL[BACKEND]} backend:"
   PLAMO3INS_i=0
-  while IFS=$'\t' read -r PLAMO3INS_pci PLAMO3INS_desc; do
+  while IFS=$'\t' read -r PLAMO3INS_pci PLAMO3INS_maker PLAMO3INS_total PLAMO3INS_used PLAMO3INS_name; do
     PLAMO3INS_i=$((PLAMO3INS_i + 1))
-    printf '  %d) %s  %s\n' "$PLAMO3INS_i" "$PLAMO3INS_pci" "$PLAMO3INS_desc"
+    PLAMO3INS_mem=""
+    ((PLAMO3INS_total == 0)) || PLAMO3INS_mem=" ($(human "$PLAMO3INS_total"), $(human "$PLAMO3INS_used") in use)"
+    printf '  %d) %s  %-6s %s%s\n' "$PLAMO3INS_i" "$PLAMO3INS_pci" "$PLAMO3INS_maker" "$PLAMO3INS_name" "$PLAMO3INS_mem"
   done <<<"$PLAMO3INS_list"
   if [[ ${PLAMO3INS_VAL[GPUS]} == all ]]; then
     PLAMO3INS_default=all
@@ -728,7 +803,7 @@ prompt_gpus() {
     done
   fi
   while :; do
-    read -r -p "GPUs to use (all, or numbers such as 1,2) [$PLAMO3INS_default]: " PLAMO3INS_answer || die "no input"
+    read -r -p "GPUs to use (numbers such as 1 or 1,2; or all) [$PLAMO3INS_default]: " PLAMO3INS_answer || die "no input"
     PLAMO3INS_answer=${PLAMO3INS_answer:-$PLAMO3INS_default}
     if [[ ${PLAMO3INS_answer,,} == all ]]; then PLAMO3INS_VAL[GPUS]=all; return 0; fi
     PLAMO3INS_sel=(); PLAMO3INS_ok=yes
@@ -744,7 +819,7 @@ prompt_gpus() {
       PLAMO3INS_VAL[GPUS]=$(IFS=,; echo "${PLAMO3INS_sel[*]}")
       return 0
     fi
-    warn "answer all, or numbers between 1 and ${#PLAMO3INS_pcis[@]} separated by commas"
+    warn "answer numbers between 1 and ${#PLAMO3INS_pcis[@]} separated by commas, or all"
   done
 }
 
@@ -874,20 +949,19 @@ preflight() {
       elif [[ ${PLAMO3INS_VAL[BACKEND]} == cuda12 && $PLAMO3INS_major -lt 570 ]]; then
         warn_continue "CUDA 12.8 needs NVIDIA driver 570 or later (found $PLAMO3INS_major)"
       fi
-      local PLAMO3INS_vram
-      PLAMO3INS_vram=0
-      local PLAMO3INS_bus PLAMO3INS_mib
-      while IFS=', ' read -r PLAMO3INS_bus PLAMO3INS_mib; do
-        [[ $PLAMO3INS_mib =~ ^[0-9]+$ ]] || continue
-        [[ ${PLAMO3INS_VAL[GPUS]} == all || ",${PLAMO3INS_VAL[GPUS]}," == *",$(normalize_pci "$PLAMO3INS_bus"),"* ]] || continue
-        PLAMO3INS_vram=$((PLAMO3INS_vram + PLAMO3INS_mib * 1024 * 1024))
-      done <<<"$(nvidia-smi --query-gpu=pci.bus_id,memory.total --format=csv,noheader,nounits 2>/dev/null || true)"
-      ((PLAMO3INS_vram > 0)) || PLAMO3INS_vram=""
-      if [[ -n $PLAMO3INS_vram ]] && ((PLAMO3INS_vram < PLAMO3INS_need_mem)); then
+      # Free memory of the selected GPUs (the installed llama-server is not counted as used).
+      local PLAMO3INS_devs PLAMO3INS_vram PLAMO3INS_nsel PLAMO3INS_vram_all PLAMO3INS_nall
+      PLAMO3INS_devs=$(gpu_devices)
+      read -r PLAMO3INS_vram PLAMO3INS_nsel <<<"$(gpu_free "$PLAMO3INS_devs")"
+      read -r PLAMO3INS_vram_all PLAMO3INS_nall <<<"$(gpu_free "$PLAMO3INS_devs" all)"
+      if ((PLAMO3INS_vram > 0 && PLAMO3INS_vram < PLAMO3INS_need_mem)); then
         if [[ ${PLAMO3INS_VAL[CTX_SIZE]} == auto ]] && ((PLAMO3INS_vram >= PLAMO3INS_min_mem)); then
-          info "The full context ($PLAMO3INS_NATIVE_CTX) needs about $(human "$PLAMO3INS_need_mem"); llama.cpp will reduce it to fit $(human "$PLAMO3INS_vram") of GPU memory"
+          info "The full context ($PLAMO3INS_NATIVE_CTX) needs about $(human "$PLAMO3INS_need_mem"); llama.cpp will reduce it to fit $(human "$PLAMO3INS_vram") of free GPU memory"
         else
-          warn "$PLAMO3INS_gguf may not fit in GPU memory ($(human "$PLAMO3INS_vram"), about $(human "$PLAMO3INS_need_mem") needed); llama.cpp will keep some layers on the CPU"
+          warn "$PLAMO3INS_gguf may not fit in the free GPU memory ($(human "$PLAMO3INS_vram"), about $(human "$PLAMO3INS_need_mem") needed); llama.cpp will keep some layers on the CPU"
+        fi
+        if ((PLAMO3INS_nall > PLAMO3INS_nsel)); then
+          info "$PLAMO3INS_nsel of $PLAMO3INS_nall GPUs selected; --gpus all lets llama.cpp split the model across all of them ($(human "$PLAMO3INS_vram_all") free in total)"
         fi
       fi ;;
     vulkan|rocm)
@@ -1430,7 +1504,7 @@ report_gpus() {
     return 0
   fi
   while IFS= read -r PLAMO3INS_line; do info "llama-server is $PLAMO3INS_line"; done <<<"$PLAMO3INS_lines"
-  [[ ${PLAMO3INS_VAL[GPUS]} != all ]] || return 0
+  gpus_restricted || return 0
   PLAMO3INS_used=$(sed -nE 's/.*\(([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])\) - .*/\1/p' <<<"$PLAMO3INS_lines" | sort -u | paste -sd, -)
   PLAMO3INS_expected=$(tr , '\n' <<<"${PLAMO3INS_VAL[GPUS]}" | sort -u | paste -sd, -)
   [[ $PLAMO3INS_used == "$PLAMO3INS_expected" ]] \
