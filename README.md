@@ -67,6 +67,20 @@ The installer uses the system nginx (`nginx.service` from apt) and shares it wit
 
 On a machine without nginx, apt also enables nginx's `default` site (port 80, "Welcome to nginx!"); the installer leaves it as it is.
 
+### Start-up order with other services
+
+`plamo-3-translate-llama.service` counts as started only when the model is loaded, not when the llama-server process is running: an `ExecStartPost=` command in the unit waits until llama-server's `/health` returns HTTP 200 (asked through the UNIX socket), and systemd keeps the unit "activating" until then. So another service that takes much of the free memory at its start (e.g. [qwen-strata-installer-for-resolute](https://github.com/astanabe/qwen-strata-installer-for-resolute) or [deepseek-maya-installer-for-resolute](https://github.com/astanabe/deepseek-maya-installer-for-resolute)) can leave PLaMo 3 Translate its memory by being ordered after it:
+
+```
+[Unit]
+After=plamo-3-translate-llama.service
+```
+
+- If llama-server exits while it loads the model, the wait ends with a failure and systemd restarts the unit after 5 seconds (`Restart=on-failure`). Units ordered after it are started when the first attempt has failed; they do not wait for the retries.
+- There is no time limit for loading the model (`TimeoutStartSec=infinity`), and `multi-user.target` is reached only when it is loaded. `systemctl start` / `restart` of the unit also return only then (use `--no-block` not to wait).
+- `plamo-3-translate-uwsgi.service` does not wait for the model: the web page is available at once, and translation requests fail with an error message until the model is loaded.
+- The order holds only at start-up. If `plamo-3-translate-llama.service` is restarted while the other services run, it gets only the memory they left.
+
 ### Files
 
 ```
@@ -216,5 +230,5 @@ echo 'こんにちは' | ./plamo-3-translate-client.py -    # standard input -> 
 3. Install dependencies via apt
 4. Create the service user if needed
 5. Download and install llama.cpp and GGUF file
-6. Generate and install systemd unit files and nginx site configuration (rolled back if nginx rejects it), start and enable servers, and reload nginx (open the ports in ufw as answered in step 1; if ufw became active after step 1, ask here)
-7. Test llama-server (`/health`) and translate a short sentence through the web server, checking that a non-empty result is returned
+6. Generate and install systemd unit files and nginx site configuration (rolled back if nginx rejects it), start and enable servers (llama-server is started without waiting for the model), and reload nginx (open the ports in ufw as answered in step 1; if ufw became active after step 1, ask here)
+7. Wait until llama-server has loaded the model (`/health`; time limit by model size: 3 minutes for 0.8B, 5 for 2B, 15 for 8B, 30 for 31B; fails at once if llama-server exits or is restarted) and translate a short sentence through the web server, checking that a non-empty result is returned

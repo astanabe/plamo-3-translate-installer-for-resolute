@@ -35,6 +35,8 @@ plamo-3-translate-client.py
 
 llama-server listens on both (`--host <127.0.0.1|0.0.0.0>,<socket path>`). The socket's RuntimeDirectory is 0750 and owned by the service user; a stale socket makes llama-server fail to start, hence `ExecStartPre=rm -f`.
 
+`plamo-3-translate-llama.service` is `Type=simple` (llama-server b12366 has no `sd_notify` support) with an `ExecStartPost=` shell loop that polls `/health` through the UNIX socket until it returns 200, so the unit stays "activating" until the model is loaded. Other installers on the same host (qwen-strata-installer-for-resolute, deepseek-maya-installer-for-resolute) order their units `After=` both plamo units to let llama-server take its memory first; their unit names must not appear on the plamo side. systemd waits for `ExecStartPost=` even after the main process exited, hence the loop's `kill -0 $MAINPID` check (it then fails, and `Restart=on-failure` restarts the unit). The uWSGI unit only `Wants=` the llama unit (no `After=`), so the web application is up while the model loads. In the installer, `start_services` stops the llama unit and starts it with `--no-block`; `wait_health` (step 7) waits with the per-model limit and treats anything but `active`/`activating` with `NRestarts=0` (or `SubState=auto-restart`) as a crash.
+
 llama-server and uWSGI are systemd units running as the install-time user (default `plamo3`, created as a system user if missing). nginx is the system `nginx.service`, running as its own user (`www-data`) and shared with other sites.
 
 ## Design decisions (agreed; don't change without asking)
@@ -62,6 +64,7 @@ llama-server and uWSGI are systemd units running as the install-time user (defau
 No test suite exists yet. End-to-end verification is step 7 of the installer itself.
 
 - `write_nginx` can be tested without root by extracting the function into a script with a stub `nginx` function and temporary `PLAMO3INS_NGINX_SITE` / `PLAMO3INS_NGINX_LINK` paths.
+- Generated units can be checked without root: extract `hardening` and `write_units` (`sed -n '/^write_units() {/,/^}$/p'`) into a script with stub variables and a temporary `PLAMO3INS_UNIT_DIR`, then run `systemd-analyze verify` on the result. The `ExecStartPost=` wait and `wait_health` can be tried with `systemctl --user` units (dummy `sleep` units, or the installed llama-server on another port with a short socket path such as `/run/user/<uid>/x.sock`; `sun_path` is limited to 107 bytes).
 - Static checks: `shellcheck install-plamo-3-translate.sh`, `bash -n`, `python3 -m py_compile plamo-3-translate-server.py plamo-3-translate-client.py`
 - The client can be tested without a model against a small stub `http.server` that answers `/v1/chat/completions` with SSE (`data: {"choices":[{"delta":{"content":...}}]}` ... `data: [DONE]`); pass `--url http://127.0.0.1:<port>`.
 - server.py can be run without uWSGI for development: `PLAMO3_LLAMA_URL=http://127.0.0.1:<port> python3 plamo-3-translate-server.py 8080` (`PLAMO3_LLAMA_URL` takes `unix:<path>` or `http://host:port`; default is the installed socket)
