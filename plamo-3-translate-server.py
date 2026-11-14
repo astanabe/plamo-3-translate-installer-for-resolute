@@ -11,10 +11,18 @@ POST /api/translate  JSON API:
              contains kana, or kanji but no hangul (Japanese is preferred, so Chinese
              text is also taken as Japanese); form is ignored when the result is not
              Japanese.
+             "stream": bool? (default false)
     response {"translation": str, "target_lang": str (the target actually used)}
              or {"error": str}
              (400 for invalid input, including text that does not fit in the
              llama-server context; 502 for other llama-server errors)
+    With "stream": true, a 200 response is NDJSON (application/x-ndjson), one object
+             per line, sent as llama-server makes progress:
+             {"target_lang": str}                            first
+             {"progress": {"processed": int, "total": int}}  prompt processing, in tokens
+             {"delta": str}                                  a piece of the translation
+             {"translation": str} or {"error": str}          last
+             Errors found before the stream starts are returned as without "stream".
 
 The request is forwarded to llama-server's /v1/chat/completions with the
 translation settings in chat_template_kwargs.  Python standard library only.
@@ -208,7 +216,9 @@ def validate_request(req):
     return text, kwargs
 
 
-def translate(text, kwargs):
+def _open_completion(text, kwargs, stream):
+    """POST to llama-server's /v1/chat/completions; return (connection, response) for a
+    200 response, or raise BadRequest/UpstreamError (the connection is then closed)."""
     payload = {
         "model": MODEL_ALIAS,
         "messages": [{"role": "user", "content": text}],
@@ -217,8 +227,10 @@ def translate(text, kwargs):
         # A translation is not much longer than its source; the bound stops runaway repetition.
         "max_tokens": min(MAX_TOKENS, 4 * len(text) + 256),
         "stop": STOP,
-        "stream": False,
+        "stream": stream,
     }
+    if stream:
+        payload["return_progress"] = True  # prompt processing progress
     headers = {"Content-Type": "application/json"}
     if LLAMA_API_KEY:
         headers["Authorization"] = "Bearer " + LLAMA_API_KEY
@@ -227,30 +239,101 @@ def translate(text, kwargs):
         conn.request("POST", prefix + "/v1/chat/completions",
                      body=json.dumps(payload).encode("utf-8"), headers=headers)
         response = conn.getresponse()
+        if response.status == 200:
+            return conn, response
+        data = response.read()
+    except (OSError, http.client.HTTPException) as e:
+        conn.close()
+        raise UpstreamError(f"cannot reach llama-server ({LLAMA_URL}): {e}")
+    conn.close()
+    try:
+        body = json.loads(data)
+    except ValueError:
+        body = None
+    detail = ""
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        detail = body["error"].get("message", "")
+    message = f"llama-server returned HTTP {response.status}" + (f": {detail}" if detail else "")
+    if response.status == 400:  # e.g. the request exceeds the context size
+        raise BadRequest(message)
+    raise UpstreamError(message)
+
+
+def translate(text, kwargs):
+    conn, response = _open_completion(text, kwargs, stream=False)
+    try:
         data = response.read()
     except (OSError, http.client.HTTPException) as e:
         raise UpstreamError(f"cannot reach llama-server ({LLAMA_URL}): {e}")
     finally:
         conn.close()
     try:
-        body = json.loads(data)
-    except ValueError:
-        body = None
-    if response.status != 200:
-        detail = ""
-        if isinstance(body, dict) and isinstance(body.get("error"), dict):
-            detail = body["error"].get("message", "")
-        message = f"llama-server returned HTTP {response.status}" + (f": {detail}" if detail else "")
-        if response.status == 400:  # e.g. the request exceeds the context size
-            raise BadRequest(message)
-        raise UpstreamError(message)
-    try:
-        content = body["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
+        content = json.loads(data)["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError):
         raise UpstreamError("unexpected response from llama-server")
     if not isinstance(content, str):
         raise UpstreamError("unexpected response from llama-server")
     return content.strip()
+
+
+def translate_stream(text, kwargs):
+    """Start a streaming translation.  Errors before the first byte raise like translate();
+    the returned generator yields events:
+        {"progress": {"processed": int, "total": int}}  prompt processing (tokens; cached
+                                                         tokens are excluded)
+        {"delta": str}                                   a piece of the translation
+        {"translation": str}                             the end: the whole (stripped) text
+        {"error": str}                                   the end: failure after the start
+    """
+    conn, response = _open_completion(text, kwargs, stream=True)
+
+    def events():
+        parts = []
+        try:
+            for raw in response:  # Server-Sent Events: "data: <json>" lines
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except ValueError:
+                    continue
+                if not isinstance(chunk, dict):
+                    continue
+                if chunk.get("error"):
+                    err = chunk["error"]
+                    detail = err.get("message", "") if isinstance(err, dict) else str(err)
+                    yield {"error": "llama-server error" + (f": {detail}" if detail else "")}
+                    return
+                progress = chunk.get("prompt_progress")
+                if isinstance(progress, dict):
+                    try:
+                        cache = int(progress.get("cache", 0))
+                        yield {"progress": {"processed": int(progress["processed"]) - cache,
+                                            "total": int(progress["total"]) - cache}}
+                    except (KeyError, TypeError, ValueError):
+                        pass
+                try:
+                    delta = chunk["choices"][0]["delta"].get("content")
+                except (KeyError, IndexError, TypeError, AttributeError):
+                    delta = None
+                if isinstance(delta, str) and delta:
+                    parts.append(delta)
+                    yield {"delta": delta}
+            else:
+                yield {"error": "llama-server closed the connection before the end"}
+                return
+        except (OSError, http.client.HTTPException) as e:
+            yield {"error": f"lost connection to llama-server ({LLAMA_URL}): {e}"}
+            return
+        finally:
+            conn.close()
+        yield {"translation": "".join(parts).strip()}
+
+    return events()
 
 
 def _json_response(start_response, status, obj):
@@ -287,14 +370,41 @@ def api_translate(environ, start_response):
     try:
         if content_type != "application/json":
             raise BadRequest("Content-Type must be application/json")
-        text, kwargs = validate_request(_read_body(environ))
-        translation = translate(text, kwargs)
+        req = _read_body(environ)
+        stream = isinstance(req, dict) and req.pop("stream", False)
+        if not isinstance(stream, bool):
+            raise BadRequest("stream must be true or false")
+        text, kwargs = validate_request(req)
+        if stream:
+            events = translate_stream(text, kwargs)
+        else:
+            translation = translate(text, kwargs)
     except BadRequest as e:
         return _json_response(start_response, "400 Bad Request", {"error": str(e)})
     except UpstreamError as e:
         return _json_response(start_response, "502 Bad Gateway", {"error": str(e)})
-    return _json_response(start_response, "200 OK",
-                          {"translation": translation, "target_lang": kwargs["target_lang"]})
+    if not stream:
+        return _json_response(start_response, "200 OK",
+                              {"translation": translation, "target_lang": kwargs["target_lang"]})
+    start_response("200 OK", [
+        ("Content-Type", "application/x-ndjson; charset=utf-8"),
+        ("Cache-Control", "no-store"),
+        ("X-Accel-Buffering", "no"),  # let nginx pass each line on at once
+    ])
+    return _ndjson_lines(events, kwargs["target_lang"])
+
+
+def _ndjson_lines(events, target_lang):
+    try:
+        yield _ndjson({"target_lang": target_lang})
+        for event in events:
+            yield _ndjson(event)
+    finally:
+        events.close()  # the browser went away: drop the llama-server connection too
+
+
+def _ndjson(obj):
+    return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
 
 
 _model_label = None
@@ -404,8 +514,9 @@ INDEX_HTML = """<!doctype html>
                      display: flex; align-items: center; justify-content: center;
                      font-size: 2.5rem; font-weight: 700; color: var(--fg); opacity: .12;
                      pointer-events: none; user-select: none; text-align: center; }
-  /* Copy buttons in the top-right corner of each textarea (left of the scrollbar). */
-  .pane .copy { position: absolute; top: .4rem; right: 1.4rem; z-index: 2;
+  /* Copy buttons in the bottom-right corner of each textarea (left of the scrollbar
+     and the resize handle). */
+  .pane .copy { position: absolute; bottom: .4rem; right: 1.4rem; z-index: 2;
                 font-size: .8rem; padding: .15rem .6rem; opacity: .75; color: var(--accent);
                 background: color-mix(in srgb, var(--accent) 12%, var(--card));
                 border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--card)); }
@@ -423,6 +534,8 @@ INDEX_HTML = """<!doctype html>
      Translation, then the rest, and the title small at the bottom.  The script sizes the
      textareas so that the first screen ends with the button and, with the button
      scrolled to the top, the second screen ends with the title. */
+  #status { display: block; min-height: 1.5em; margin-top: .75rem; text-align: center; color: var(--muted); }
+  #status.error { color: var(--err); }
   @media (max-width: 760px) {
     body { padding: .5rem .75rem .75rem; }
     main { width: auto; display: flex; flex-direction: column; }
@@ -441,10 +554,12 @@ INDEX_HTML = """<!doctype html>
     .go-top, .go-left, .go-right { display: none; }
     .pane textarea { height: 40vh; resize: none; }
     .pane .watermark { font-size: 1.8rem; }
+    /* No status line (its height goes to Translation): progress is shown on the
+       button, and only errors are shown here. */
+    #status { display: none; }
+    #status.error { display: block; }
   }
   button:disabled { opacity: .5; cursor: progress; }
-  #status { display: block; min-height: 1.5em; margin-top: .75rem; text-align: center; color: var(--muted); }
-  #status.error { color: var(--err); }
 </style>
 </head>
 <body>
@@ -642,15 +757,76 @@ INDEX_HTML = """<!doctype html>
       window.scrollTo({ top: pageTop(mainBtn), behavior: "smooth" });
     }
     var t0 = Date.now();
+    var result = $("result");
+    result.value = "";
+    req.stream = true;
+    function elapsed() { return ((Date.now() - t0) / 1000).toFixed(1) + " s"; }
+    // Pieces of the translation are added to the textarea once per frame, keeping it
+    // scrolled to the end unless the user has scrolled up.
+    var pending = "", frame = 0;
+    function flush() {
+      frame = 0;
+      if (!pending) return;
+      var atEnd = result.scrollTop + result.clientHeight >= result.scrollHeight - 8;
+      result.value += pending; pending = "";
+      if (atEnd) result.scrollTop = result.scrollHeight;
+    }
+    var chars = 0;
+    function handle(ev, d) {
+      if (ev.target_lang) d.target_lang = ev.target_lang;
+      if (ev.progress && ev.progress.total > 0) {
+        var pct = Math.floor(100 * ev.progress.processed / ev.progress.total) + "%";
+        status.textContent = "Reading the source text... " + pct + " (" + elapsed() + ")";
+        if (mobile.matches) mainBtn.textContent = "Reading... " + pct;
+      }
+      if (typeof ev.delta === "string") {
+        pending += ev.delta; chars += ev.delta.length;
+        if (!frame) frame = requestAnimationFrame(flush);
+        status.textContent = "Translating... " + chars + " characters (" + elapsed() + ")";
+        if (mobile.matches) mainBtn.textContent = "Translating...";
+      }
+      if (typeof ev.translation === "string") d.translation = ev.translation;
+      if (ev.error) d.error = ev.error;
+    }
+    // Read the NDJSON stream; resolves to {target_lang, translation} or {error}.
+    function readStream(r) {
+      var reader = r.body.getReader(), decoder = new TextDecoder(), buf = "", d = {};
+      function line(s) {
+        if (!s.trim()) return;
+        var ev;
+        try { ev = JSON.parse(s); } catch (e) { d.error = "invalid response from the server"; return; }
+        handle(ev, d);
+      }
+      function pump() {
+        return reader.read().then(function (x) {
+          if (!x.done) buf += decoder.decode(x.value, { stream: true });
+          var lines = buf.split("\\n");
+          buf = x.done ? "" : lines.pop();
+          lines.forEach(line);
+          if (x.done || d.error) {
+            if (!x.done) reader.cancel().catch(function () {});
+            if (frame) { cancelAnimationFrame(frame); }
+            flush();
+            if (!d.error && typeof d.translation !== "string")
+              d.error = "the connection was closed before the translation finished";
+            return d;
+          }
+          return pump();
+        });
+      }
+      return pump();
+    }
     fetch("api/translate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req)
     }).then(function (r) {
+      var ct = r.headers.get("Content-Type") || "";
+      if (r.ok && r.body && ct.indexOf("application/x-ndjson") === 0) return readStream(r);
       return r.json().catch(function () { return { error: "HTTP " + r.status }; });
     }).then(function (d) {
       if (d.error) throw new Error(d.error);
-      $("result").value = d.translation;
+      if (result.value !== d.translation) result.value = d.translation;
       var opt = $("target_lang").querySelector('option[value="' + d.target_lang + '"]');
       status.textContent = "Done in " + ((Date.now() - t0) / 1000).toFixed(1) + " s" +
         (req.target_lang === "auto" && opt ? " (\u2192 " + opt.textContent.replace(/ \\(.*\\)$/, "") + ")" : "");
