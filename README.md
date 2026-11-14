@@ -2,7 +2,7 @@
 
 PLaMo 3 Translate installer script for Ubuntu 26.04 LTS Resolute Raccoon (Server or Desktop)
 
-# Prerequisites
+## Prerequisites
 
 - Ubuntu 26.04 LTS (Resolute Raccoon), x86_64, Server or Desktop (tested on Ubuntu Server; Ubuntu on WSL is not supported)
   - On Desktop, the display also uses GPU memory, so the context size chosen automatically may be smaller; the services stop while the machine is suspended
@@ -13,7 +13,7 @@ PLaMo 3 Translate installer script for Ubuntu 26.04 LTS Resolute Raccoon (Server
   - NVIDIA (`cuda12`, `cuda13`): install the NVIDIA driver and reboot (e.g. `sudo ubuntu-drivers install`), so that `nvidia-smi` works. CUDA 12.8 needs driver 570 or later and CUDA 13.5 needs driver 580 or later. The installer stops if `nvidia-smi` does not work.
   - AMD / Intel (`vulkan`, `rocm`): the in-kernel `amdgpu` / `i915` / `xe` driver must be loaded (`/dev/dri` exists; ROCm also needs `/dev/kfd`).
 
-# Usage
+## Usage
 
 ```
 bash install-plamo-3-translate.sh                    # interactive install
@@ -28,7 +28,7 @@ bash install-plamo-3-translate.sh --uninstall        # uninstall
 - Re-running the installer updates the existing installation in place (files and systemd units are overwritten; an already-downloaded GGUF file and llama.cpp build are reused after checksum verification). If the model or quantization changed, the installer offers to delete the unused GGUF file. An API key generated for llama-server is kept.
 - `--uninstall` stops and disables the services and removes the systemd units, the nginx site configuration, `/etc/plamo-3-translate`, the ufw rules added by the installer and destdir. apt packages and the service user are kept.
 
-## Options
+### Options
 
 | Option | Environment variable | Default |
 |---|---|---|
@@ -55,7 +55,7 @@ GPU selection: when the selected backend can use two or more GPUs (NVIDIA for CU
 
 Network interfaces: when two or more network interfaces have global addresses (container/VM bridges such as `docker0`, `virbr0` and `lxdbr0` are ignored), the installer asks on which of them the web server (and llama-server if exposed) accept connections from other hosts (`all` or numbers). With selected interfaces, nginx and llama-server listen on their current addresses plus `127.0.0.1` (and `::1` for nginx), and the ufw rules are limited to them (`ufw allow in on IF to any port PORT proto tcp`). The interface names are saved and the addresses are looked up at installation, so re-run the installer if an address changes. Rules added by an earlier run that are no longer wanted (e.g. a rule for all interfaces) are removed.
 
-## Files
+### Files
 
 ```
 <destdir>/                                  default /opt/plamo-3-translate
@@ -75,7 +75,7 @@ Network interfaces: when two or more network interfaces have global addresses (c
 
 Downloads are verified with SHA-256 checksums built into the installer (llama.cpp release assets and pinned Hugging Face revisions of the GGUF files).
 
-# Models
+## Models
 
 - PLaMo 3 Translate 0.8B
   - https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF
@@ -86,13 +86,13 @@ Downloads are verified with SHA-256 checksums built into the installer (llama.cp
 - PLaMo 3 Translate 31B
   - https://huggingface.co/pfnet/plamo-3-translate-31b-GGUF
 
-# License
+## License
 
-## License of this repository
+### License of this repository
 
 The files in this repository (the installer, plamo-3-translate-server.py, plamo-3-translate-client.py and the documentation) are distributed under the MIT License. See [LICENSE](LICENSE).
 
-## License of PLaMo 3 Translate models
+### License of PLaMo 3 Translate models
 
 The PLaMo 3 Translate models downloaded by the installer are not part of this repository. They are distributed by Preferred Networks, Inc. (PFN) under the PLaMo Community License, not under the MIT License.
 
@@ -100,7 +100,7 @@ The PLaMo 3 Translate models downloaded by the installer are not part of this re
 
 Personal and non-commercial use is free. Commercial use requires registration with PFN. Read the full license text before using the models. The installer shows a summary of the license and aborts unless the user types `yes`. In non-interactive mode, `--accept-license` is required.
 
-# Engine
+## Engine
 
 - llama.cpp b12366
   - https://github.com/ggml-org/llama.cpp/releases/tag/b12366
@@ -114,14 +114,14 @@ Personal and non-commercial use is free. Commercial use requires registration wi
 - Context size: by default (`auto`) `-c` is omitted, so llama-server uses the model maximum (262144 tokens for all sizes) and, with its `--fit` feature, reduces the context (down to 4096) when it does not fit in the memory. The actual size is shown at the end of the installation. An explicit `--ctx-size N` (512–262144) is used as is.
 - Memory for the full 262144-token context (Q4_K_M, model + KV cache + buffers, approximate): 0.8B 2.1 GB, 2B 4.5 GB, 8B 8.2 GB, 31B 28 GB. Only one layer in eight attends to the whole context, so the KV cache is small for this context length.
 
-# Quantization
+## Quantization
 
 - Q2_K
 - Q3_K_M
 - Q4_K_M (default)
 - Q4_0 (0.8B and 2B models only)
 
-# Architecture
+## Architecture
 
 ```
 web browser ──→ nginx-full (TCP 18080) ──→ uWSGI ──→ plamo-3-translate-server.py ──┐
@@ -148,12 +148,12 @@ plamo-3-translate-client.py ──────────────── TCP
 - llama-server listens on the UNIX socket and on TCP `127.0.0.1` by default. If exposure is enabled, the TCP port listens on `0.0.0.0` (or on the selected interfaces, see `--interfaces`) and an API key (`--api-key`) generated by the installer is required (on the socket too; plamo-3-translate-server.py sends it).
 - TLS and authentication for the web server are out of scope.
 
-# Client
+## Client
 
 - Web browser (web server, TCP 18080)
 - plamo-3-translate-client.py (provided in this repository; connects to llama-server, TCP 28080)
 
-# Procedure
+## Procedure
 
 1. Ask user for destdir (default `/opt/plamo-3-translate`), username (default `plamo3`), model (default 2B), quantization (default Q4_K_M), llama.cpp backend, GPUs to use (only if the backend sees two or more), context size (default `auto`: the model maximum, reduced to fit the memory), web server port (default 18080), llama-server port (default 28080), whether to expose the llama-server, network interfaces to listen on (only if two or more have addresses), whether to open the ports in ufw (only if ufw is active and the ports are not allowed yet), and license acceptance
 2. Check prerequisites: ports are not in use, enough free disk space and memory for the selected GGUF file (warn and ask to continue if insufficient)
