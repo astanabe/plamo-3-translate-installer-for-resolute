@@ -16,6 +16,10 @@ POST /api/translate  JSON API:
              or {"error": str}
              (400 for invalid input, including text that does not fit in the
              llama-server context; 502 for other llama-server errors)
+             A translation cut off at the token limit (finish_reason "length") is an
+             error, not a partial result: 400 when the context is full, 502 when the
+             output reached max_tokens (e.g. repetition); the token counts are logged
+             to stderr (the uWSGI journal).
     With "stream": true, a 200 response is NDJSON (application/x-ndjson), one object
              per line, sent as llama-server makes progress:
              {"target_lang": str}                            first
@@ -44,6 +48,7 @@ import json
 import os
 import re
 import socket
+import sys
 import urllib.parse
 
 LLAMA_URL = (os.environ.get("PLAMO3_LLAMA_URL") or "unix:/run/plamo-3-translate-llama/llama.sock").rstrip("/")
@@ -216,6 +221,44 @@ def validate_request(req):
     return text, kwargs
 
 
+def _max_tokens(text):
+    # A translation is not much longer than its source; the bound stops runaway repetition.
+    return min(MAX_TOKENS, 4 * len(text) + 256)
+
+
+CUT_OFF_CONTEXT = ("The translation was cut off: the text is too long for this server (the source "
+                   "and the translation must fit in its context).  Translate the text in smaller "
+                   "parts; if you need to translate longer texts at once, contact the "
+                   "administrator.")
+CUT_OFF_OUTPUT = ("The translation was cut off: the output reached its limit (the model may have "
+                  "kept repeating itself).  Try again with a shorter or reworded text; if this "
+                  "keeps happening, contact the administrator.")
+CUT_OFF_UNKNOWN = ("The translation was cut off at the token limit.  Try again with a shorter "
+                   "text; if this keeps happening, contact the administrator.")
+
+
+def _cut_off(text, timings):
+    """Exception for a translation stopped at the token limit (finish_reason "length").
+    The cause is told from llama-server's timings: the output reached max_tokens, or else
+    the context is full.  The token counts are logged for the administrator."""
+    limit = _max_tokens(text)
+    try:
+        prompt = int(timings.get("cache_n", 0)) + int(timings["prompt_n"])
+        generated = int(timings["predicted_n"])
+    except (AttributeError, KeyError, TypeError, ValueError):
+        prompt = generated = None
+    if generated is None:
+        cause, error = "unknown cause", UpstreamError(CUT_OFF_UNKNOWN)
+    elif generated >= limit:
+        cause, error = "output limit", UpstreamError(CUT_OFF_OUTPUT)
+    else:
+        cause, error = "context full", BadRequest(CUT_OFF_CONTEXT)
+    print(f"plamo-3-translate-server: translation cut off ({cause}): prompt {prompt} tokens, "
+          f"generated {generated} tokens, max_tokens {limit}, source {len(text)} characters",
+          file=sys.stderr, flush=True)
+    return error
+
+
 def _open_completion(text, kwargs, stream):
     """POST to llama-server's /v1/chat/completions; return (connection, response) for a
     200 response, or raise BadRequest/UpstreamError (the connection is then closed)."""
@@ -224,8 +267,7 @@ def _open_completion(text, kwargs, stream):
         "messages": [{"role": "user", "content": text}],
         "chat_template_kwargs": kwargs,
         "temperature": 0,
-        # A translation is not much longer than its source; the bound stops runaway repetition.
-        "max_tokens": min(MAX_TOKENS, 4 * len(text) + 256),
+        "max_tokens": _max_tokens(text),
         "stop": STOP,
         "stream": stream,
     }
@@ -268,11 +310,15 @@ def translate(text, kwargs):
     finally:
         conn.close()
     try:
-        content = json.loads(data)["choices"][0]["message"]["content"]
+        body = json.loads(data)
+        choice = body["choices"][0]
+        content = choice["message"]["content"]
     except (ValueError, KeyError, IndexError, TypeError):
         raise UpstreamError("unexpected response from llama-server")
     if not isinstance(content, str):
         raise UpstreamError("unexpected response from llama-server")
+    if choice.get("finish_reason") == "length":
+        raise _cut_off(text, body.get("timings"))
     return content.strip()
 
 
@@ -284,11 +330,14 @@ def translate_stream(text, kwargs):
         {"delta": str}                                   a piece of the translation
         {"translation": str}                             the end: the whole (stripped) text
         {"error": str}                                   the end: failure after the start
+                                                         (including a translation cut off
+                                                         at the token limit)
     """
     conn, response = _open_completion(text, kwargs, stream=True)
 
     def events():
         parts = []
+        finish_reason = timings = None
         try:
             for raw in response:  # Server-Sent Events: "data: <json>" lines
                 line = raw.decode("utf-8", "replace").strip()
@@ -323,6 +372,12 @@ def translate_stream(text, kwargs):
                 if isinstance(delta, str) and delta:
                     parts.append(delta)
                     yield {"delta": delta}
+                try:
+                    finish_reason = chunk["choices"][0].get("finish_reason") or finish_reason
+                except (KeyError, IndexError, TypeError, AttributeError):
+                    pass
+                if isinstance(chunk.get("timings"), dict):
+                    timings = chunk["timings"]
             else:
                 yield {"error": "llama-server closed the connection before the end"}
                 return
@@ -331,6 +386,9 @@ def translate_stream(text, kwargs):
             return
         finally:
             conn.close()
+        if finish_reason == "length":
+            yield {"error": str(_cut_off(text, timings))}
+            return
         yield {"translation": "".join(parts).strip()}
 
     return events()
