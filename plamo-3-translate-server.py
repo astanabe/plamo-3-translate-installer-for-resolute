@@ -6,7 +6,13 @@ POST /api/translate  JSON API:
     request  {"text": str, "target_lang": str, "source_lang": str?,
               "form": "plain"|"polite"?, "glossary": [{"source", "target"}]?,
               "context": str?}
-    response {"translation": str}  or  {"error": str}
+    target_lang "auto": Japanese -> English, any other language -> Japanese.  The source
+             is Japanese if source_lang is "ja", or (without source_lang) if the text
+             contains kana, or kanji but no hangul (Japanese is preferred, so Chinese
+             text is also taken as Japanese); form is ignored when the result is not
+             Japanese.
+    response {"translation": str, "target_lang": str (the target actually used)}
+             or {"error": str}
              (400 for invalid input, including text that does not fit in the
              llama-server context; 502 for other llama-server errors)
 
@@ -66,6 +72,26 @@ LANGUAGES = [
 ]
 LANGUAGE_CODES = {code for code, _ in LANGUAGES}
 FORMS = ("plain", "polite")
+# Hiragana, katakana (incl. phonetic extensions) and half-width katakana.
+KANA = re.compile("[\u3041-\u309f\u30a0-\u30ff\u31f0-\u31ff\uff66-\uff9f]")
+# Kanji (CJK unified ideographs, extension A, compatibility ideographs, extensions B and
+# later) and the marks 々 〆 〇.
+KANJI = re.compile("[\u3005-\u3007\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]")
+# Hangul syllables and jamo: Korean text may contain hanja.
+HANGUL = re.compile("[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]")
+
+
+def looks_japanese(text):
+    """Japanese preferred: kana, or kanji without hangul (Chinese counts as Japanese)."""
+    if KANA.search(text):
+        return True
+    return bool(KANJI.search(text)) and not HANGUL.search(text)
+
+
+def auto_target(text, source):
+    """Target language for target_lang "auto": English for Japanese, Japanese otherwise."""
+    is_japanese = source == "ja" if source else looks_japanese(text)
+    return "en" if is_japanese else "ja"
 RESERVED = "<|plamo:"
 
 
@@ -136,9 +162,8 @@ def validate_request(req):
     kwargs = {}
 
     target = req.get("target_lang")
-    if not isinstance(target, str) or target not in LANGUAGE_CODES:
-        raise BadRequest("target_lang must be one of the supported language codes")
-    kwargs["target_lang"] = target
+    if not isinstance(target, str) or (target not in LANGUAGE_CODES and target != "auto"):
+        raise BadRequest('target_lang must be "auto" or one of the supported language codes')
 
     source = _optional(req, "source_lang")
     if source is not None:
@@ -146,13 +171,19 @@ def validate_request(req):
             raise BadRequest("source_lang must be one of the supported language codes")
         kwargs["source_lang"] = source
 
+    automatic = target == "auto"
+    if automatic:
+        target = auto_target(text, source)
+    kwargs["target_lang"] = target
+
     form = _optional(req, "form")
     if form is not None:
         if form not in FORMS:
             raise BadRequest("form must be plain or polite")
-        if target != "ja":
+        if target == "ja":
+            kwargs["form"] = form
+        elif not automatic:
             raise BadRequest('form requires target_lang "ja"')
-        kwargs["form"] = form
 
     context = _optional(req, "context")
     if context is not None:
@@ -262,7 +293,8 @@ def api_translate(environ, start_response):
         return _json_response(start_response, "400 Bad Request", {"error": str(e)})
     except UpstreamError as e:
         return _json_response(start_response, "502 Bad Gateway", {"error": str(e)})
-    return _json_response(start_response, "200 OK", {"translation": translation})
+    return _json_response(start_response, "200 OK",
+                          {"translation": translation, "target_lang": kwargs["target_lang"]})
 
 
 _model_label = None
@@ -425,18 +457,19 @@ INDEX_HTML = """<!doctype html>
   <div class="row">
     <div>
       <label for="source_lang">Source language</label>
-      <select id="source_lang"><option value="">Detect automatically</option>
+      <select id="source_lang"><option value="">Auto-detect (Japanese preferred)</option>
 @@LANGUAGE_OPTIONS@@
       </select>
     </div>
     <div>
       <label for="target_lang">Target language</label>
       <select id="target_lang">
+        <option value="auto">Auto: Japanese &rarr; English, others &rarr; Japanese</option>
 @@LANGUAGE_OPTIONS@@
       </select>
     </div>
     <div>
-      <label for="form">Japanese style <span class="hint">(target Japanese only)</span></label>
+      <label for="form">Japanese style <span class="hint">(when the result is Japanese)</span></label>
       <select id="form"><option value="">Default</option>
         <option value="polite">Polite (desu/masu)</option>
         <option value="plain">Plain (da/dearu)</option>
@@ -536,8 +569,9 @@ INDEX_HTML = """<!doctype html>
     var saved = JSON.parse(localStorage.getItem(KEY) || "{}");
     fields.forEach(function (k) { if (saved[k] !== undefined) $(k).value = saved[k]; });
   } catch (e) {}
-  if (!$("target_lang").value) $("target_lang").value = "en";
-  function syncForm() { $("form").disabled = $("target_lang").value !== "ja"; }
+  if (!$("target_lang").value) $("target_lang").value = "auto";
+  // The style applies when the result is Japanese (with Auto: for non-Japanese source text).
+  function syncForm() { var t = $("target_lang").value; $("form").disabled = t !== "ja" && t !== "auto"; }
   $("target_lang").addEventListener("change", syncForm);
   syncForm();
 
@@ -617,7 +651,9 @@ INDEX_HTML = """<!doctype html>
     }).then(function (d) {
       if (d.error) throw new Error(d.error);
       $("result").value = d.translation;
-      status.textContent = "Done in " + ((Date.now() - t0) / 1000).toFixed(1) + " s";
+      var opt = $("target_lang").querySelector('option[value="' + d.target_lang + '"]');
+      status.textContent = "Done in " + ((Date.now() - t0) / 1000).toFixed(1) + " s" +
+        (req.target_lang === "auto" && opt ? " (\u2192 " + opt.textContent.replace(/ \\(.*\\)$/, "") + ")" : "");
       setClearMode(true);
     }).catch(function (e) {
       status.className = "error";
