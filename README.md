@@ -189,18 +189,22 @@ A command-line client that translates a plain text or Markdown file (or standard
 ./plamo-3-translate-client.py doc.md                  # -> doc.en.md (or doc.ja.md)
 ./plamo-3-translate-client.py --to en -o out.txt in.txt
 echo 'こんにちは' | ./plamo-3-translate-client.py -    # standard input -> standard output
+./plamo-3-translate-client.py --intermediate en --to ja -o out.md in.md   # round trip: -> en -> ja
 ```
 
 | Option | Default |
 |---|---|
 | `INPUT` | file to translate, or `-` for standard input |
-| `-o`, `--output PATH` | output file, or `-` for standard output. Default: for a file, an automatically named file (see below); for standard input, standard output |
+| `-o`, `--output PATH` | output file, or `-` for standard output. Default: for a file, an automatically named file (see below); for standard input, standard output. Required with `--intermediate` |
 | `-f`, `--force` | overwrite an existing output file (without it, an existing output file is an error) |
 | `--from LANG` | detected (Japanese preferred, as in the web form) |
-| `--to LANG\|auto` | `auto`: Japanese to English, anything else to Japanese (decided once for the whole document) |
-| `--form plain\|polite` | style of Japanese translations (target `ja` only; ignored when `auto` gives another language) |
+| `--to LANG\|auto` | `auto`: Japanese to English, anything else to Japanese (decided once for the whole document). A language is required with `--intermediate` |
+| `--intermediate LANG` | none. Round-trip translation: translate into `LANG` first, then from `LANG` into `--to` (see below) |
+| `--intermediate-output PATH` | none. With `--intermediate`, also write the whole document in the intermediate language to this file |
+| `--form plain\|polite` | style of Japanese translations (target `ja` only; ignored when `auto` gives another language). With `--intermediate`, used in the second pass |
 | `--format auto\|text\|markdown` | `auto`: `markdown` for `.md` and `.markdown` files, `text` otherwise (also for standard input) |
-| `--glossary FILE` | one `source => target` per line (blank lines and lines starting with `#` are ignored; up to 500 entries) |
+| `--glossary FILE` | one `source => target` per line (blank lines and lines starting with `#` are ignored; up to 500 entries). With `--intermediate`, used in the first pass (source to intermediate) |
+| `--glossary2 FILE` | with `--intermediate`, the glossary of the second pass (intermediate to target); same format and limits as `--glossary` |
 | `--context TEXT` / `--context-file FILE` | background information about the document passed to the model |
 | `--chunk-chars N` | `20000`: maximum source characters per request |
 | `--url URL` | `$PLAMO3_LLAMA_URL`, or `http://127.0.0.1:28080` (`http://` only) |
@@ -214,6 +218,19 @@ echo 'こんにちは' | ./plamo-3-translate-client.py -    # standard input -> 
 - Long documents are split into chunks of at most `--chunk-chars` characters: paragraphs (separated by blank lines) are packed together; a paragraph longer than that is split between lines, keeping a Markdown table (consecutive lines starting with `|`) in one piece. Lines are never split: a line or table longer than `--chunk-chars` is sent alone with a warning. Blank lines and the whitespace around each chunk are kept as in the source. Each request carries the preceding source/translation pairs (source and translation, up to 2.5 × `--chunk-chars` characters in all) as translation history, as described in the model card, so that terms and style stay consistent. With the defaults, a request of a long Japanese or English document can need about 40000 tokens of context (the tokenizer uses about 0.4 tokens per Japanese character and 0.16 per English character; Chinese, Korean and some other scripts use 0.8 or more, so they need more). Lower `--chunk-chars` if llama-server reports that the request does not fit in its context; the installer warns when the context is smaller than that.
 - Progress goes to standard error: the chunk number and the prompt processing percentage, then, when writing to a file, the translation as it is generated; when writing to standard output, only the number of characters generated, and each chunk is written to standard output as soon as it is translated.
 - If llama-server stops a translation at the token limit (`finish_reason` `"length"`: the context is full, or the output reached the limit of 4 tokens per source character, e.g. because the model kept repeating itself), the client stops with an error instead of writing a truncated translation, and advises a smaller `--chunk-chars` (which also shortens the history) or breaking up a very long line or table.
+- Round-trip translation (`--intermediate LANG`): the document is translated twice, from the input language into `LANG` and from `LANG` into `--to`, which flattens the personal style of the text (e.g. Japanese → English → Japanese). Without `--intermediate` nothing changes.
+  ```
+  ./plamo-3-translate-client.py --intermediate en --to ja --glossary ja-en.txt --glossary2 en-ja.txt \
+      --intermediate-output doc.mid.md -o doc.out.md doc.md
+  ```
+  - `--to` must be given as a language (not `auto`) different from `LANG`, and `-o` is required, also for standard input (`-o -` for standard output); no output file name is chosen automatically.
+  - There are two passes: every chunk is translated into `LANG` (pass 1), then every intermediate chunk into the target language (pass 2). The chunks are those of the source document in both passes (the intermediate text is not split again), and each pass has its own translation history. `--from` (if given) and `--glossary` apply to pass 1; pass 2 always names `LANG` as its source language and uses `--glossary2` and `--form`. `--context` is passed to both.
+  - `--intermediate-output PATH` writes the whole document in the intermediate language (with the parts copied unchanged, BOM and CRLF as in the input) when pass 1 is complete. It must be a file (not `-`) other than the input and `-o`; an existing file needs `-f`. It is kept when pass 2 fails.
+  - An empty translation in pass 1 is an error. Progress shows a heading per pass (`Pass 1/2: ja -> en`, with `auto` when `--from` is not given) and, when writing to a file, the intermediate translation as well.
+  - If the input is already written in `LANG`, pass 1 is pointless; this is not checked.
+  - Proper nouns and terms can change on the way there and back; the two glossaries keep them in place (`--glossary`: source => intermediate, `--glossary2`: intermediate => target).
+  - Markdown markup is more likely to be damaged than with one translation, and the run takes about twice as long.
+  - There is no resume. If pass 2 fails, translate the `--intermediate-output` document as usual: `./plamo-3-translate-client.py --from LANG --to <target> --glossary <the --glossary2 file> -o doc.out.md doc.mid.md`.
 - Exit status: 0 success, 1 translation error (connection, API key, llama-server error), 2 invalid arguments or input, 130 interrupted.
 - API key: when llama-server is exposed, every request needs the key the installer generated, which is stored in `/etc/plamo-3-translate/llama-server.env` (readable by root and the service user only). Copy it into a file of your own and pass it with `--api-key-file` (or set `PLAMO3_LLAMA_API_KEY`):
   ```

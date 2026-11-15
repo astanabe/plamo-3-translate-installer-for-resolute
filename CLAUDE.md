@@ -18,7 +18,7 @@ A bash installer that sets up a PLaMo 3 Translate web service on **Ubuntu 26.04 
 
 - `install-plamo-3-translate.sh` — installer (interactive, non-interactive via options/env vars, `--uninstall`; re-runnable in place)
 - `plamo-3-translate-server.py` — WSGI app under uWSGI: `GET /` HTML form, `POST /api/translate` JSON API, calls llama-server
-- `plamo-3-translate-client.py` — CLI client that talks to llama-server directly (TCP 28080 default): translates a text/Markdown file or stdin keeping its layout, in chunks with translation history. Not installed by the installer; used from the repository. It copies the language list, auto-target detection, request payload and SSE parsing from server.py (no import: server.py is deployed as a single file) — keep both in sync.
+- `plamo-3-translate-client.py` — CLI client that talks to llama-server directly (TCP 28080 default): translates a text/Markdown file or stdin keeping its layout, in chunks with translation history. `--intermediate LANG` translates twice (source → LANG → `--to`, two passes over the same chunks; client-only, the request format is unchanged). Not installed by the installer; used from the repository. It copies the language list, auto-target detection, request payload and SSE parsing from server.py (no import: server.py is deployed as a single file) — keep both in sync.
 
 ## Architecture (request path)
 

@@ -10,6 +10,11 @@ characters; each request carries the preceding source/translation pairs as histo
 the translation stays consistent.  In Markdown, front matter, fenced code blocks, HTML
 blocks, link reference definitions and $$ math blocks are copied unchanged.
 
+With --intermediate LANG the document is translated twice, source -> LANG -> --to (a round
+trip that flattens the personal style of the text): first every chunk into LANG, then every
+intermediate chunk into the target language.  The chunks are those of the source in both
+passes, and each pass has its own translation history.
+
 Environment variables:
     PLAMO3_LLAMA_URL        llama-server address, http://<host>:<port> (default
                             http://127.0.0.1:28080)
@@ -561,11 +566,116 @@ def same_file(a, b):
         return os.path.realpath(a) == os.path.realpath(b)
 
 
+def check_output(path, input_path, force, what):
+    if input_path is not None and same_file(input_path, path):
+        raise UsageError(f"{what} {path} is the input file")
+    if os.path.isdir(path):
+        raise UsageError(f"{what} {path} is a directory")
+    if os.path.lexists(path) and not force:
+        raise UsageError(f"{what} {path} exists (use -f to overwrite)")
+
+
+class OutputFile:
+    """A file written through a temporary file in the same directory: commit() renames it
+    to path, discard() removes it (and does nothing after commit())."""
+
+    def __init__(self, path):
+        self.path = path
+        directory = os.path.dirname(path) or "."
+        try:
+            fd, self.temp = tempfile.mkstemp(dir=directory,
+                                             prefix="." + os.path.basename(path) + ".",
+                                             suffix=".tmp")
+        except OSError as e:
+            raise UsageError(f"cannot write to {directory}: {e.strerror}")
+        self.fh = os.fdopen(fd, "wb")
+
+    def commit(self):
+        self.fh.close()
+        try:
+            mode = os.stat(self.path).st_mode & 0o7777
+        except OSError:
+            umask = os.umask(0)
+            os.umask(umask)
+            mode = 0o666 & ~umask
+        os.chmod(self.temp, mode)
+        os.replace(self.temp, self.path)
+        self.temp = None
+
+    def discard(self):
+        if self.temp is None:
+            return
+        try:
+            self.fh.close()
+        except OSError:
+            pass
+        try:
+            os.unlink(self.temp)
+        except OSError:
+            pass
+        self.temp = None
+
+
+def layout(pieces):
+    """Return (bodies, frames, tail) for [(translate, text)]: the stripped chunks to
+    translate, the (prefix, suffix) to put around each translation (copied text and the
+    whitespace around the chunk) and the copied text after the last chunk."""
+    bodies, frames = [], []
+    pending = ""  # copied text not yet assigned to a chunk
+    for translate, piece in pieces:
+        if not translate:
+            pending += piece
+            continue
+        bodies.append(piece.strip())
+        lead = piece[:len(piece) - len(piece.lstrip())]
+        trail = piece[len(piece.rstrip()):]
+        frames.append((pending + lead, trail))
+        pending = ""
+    return bodies, frames, pending
+
+
+def template_kwargs(target, source, form, glossary, context):
+    kwargs = {"target_lang": target}
+    if source:
+        kwargs["source_lang"] = source
+    if form and target == "ja":
+        kwargs["form"] = form
+    if glossary:
+        kwargs["glossary"] = glossary
+    if context:
+        kwargs["context"] = context
+    return kwargs
+
+
+def translate_pass(llama, bodies, kwargs, chunk_chars, progress, on_result):
+    """Translate bodies in order, each request carrying the preceding pairs of this pass as
+    history, and call on_result(index, translation) (index from 0) after each one."""
+    history = []
+    for index, body in enumerate(bodies):
+        # History: the preceding pairs, newest first, up to 2.5 x --chunk-chars in all.
+        context_pairs, size = [], 0
+        for pair in reversed(history):
+            size += len(pair[0]) + len(pair[1])
+            if size > HISTORY_FACTOR * chunk_chars:
+                break
+            context_pairs.insert(0, pair)
+        progress.start(index + 1, len(bodies), len(body))
+        try:
+            translation = llama.translate(context_pairs, body, kwargs, progress.event)
+        except BaseException:
+            progress.abort()
+            raise
+        progress.finish(translation)
+        history.append((body, translation))
+        on_result(index, translation)
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(
         prog="plamo-3-translate-client.py",
         description="Translate a plain text or Markdown file with PLaMo 3 Translate "
-                    "through llama-server, keeping its layout.",
+                    "through llama-server, keeping its layout.  With --intermediate, "
+                    "translate it twice: into the intermediate language, then into --to.",
         epilog="Environment: PLAMO3_LLAMA_URL (default " + DEFAULT_URL + "), "
                "PLAMO3_LLAMA_API_KEY.  Exit status: 0 success, 1 translation error, "
                "2 invalid arguments or input, 130 interrupted.")
@@ -574,22 +684,35 @@ def parse_args(argv):
     parser.add_argument("-o", "--output", metavar="PATH",
                         help='output file, or "-" for standard output (default for a file: '
                              'INPUT with the target language code before the extension, '
-                             'e.g. doc.md -> doc.en.md; for standard input: standard output)')
+                             'e.g. doc.md -> doc.en.md; for standard input: standard output; '
+                             'required with --intermediate)')
     parser.add_argument("-f", "--force", action="store_true",
                         help="overwrite an existing output file")
     parser.add_argument("--from", dest="source", metavar="LANG",
                         help="source language (default: detected, Japanese preferred)")
     parser.add_argument("--to", dest="target", metavar="LANG", default="auto",
                         help="target language, or auto (default): Japanese to English, "
-                             "anything else to Japanese")
+                             "anything else to Japanese (a language is required with "
+                             "--intermediate)")
+    parser.add_argument("--intermediate", metavar="LANG",
+                        help="round trip: translate into LANG first, then from LANG into "
+                             "--to (requires --to LANG and -o)")
+    parser.add_argument("--intermediate-output", metavar="PATH",
+                        help="with --intermediate, also write the whole document in the "
+                             "intermediate language to PATH when the first pass is complete")
     parser.add_argument("--form", choices=FORMS,
-                        help="style of Japanese translations (target ja only)")
+                        help="style of Japanese translations (target ja only; with "
+                             "--intermediate, used in the second pass)")
     parser.add_argument("--format", choices=("auto", "text", "markdown"), default="auto",
                         help="input format (default auto: markdown for .md and .markdown "
                              "files, text otherwise)")
     parser.add_argument("--glossary", metavar="FILE",
                         help='glossary file: one "source => target" per line, '
-                             "blank lines and lines starting with # ignored")
+                             "blank lines and lines starting with # ignored (with "
+                             "--intermediate: for the first pass, source to intermediate)")
+    parser.add_argument("--glossary2", metavar="FILE",
+                        help="with --intermediate, glossary file for the second pass "
+                             "(intermediate to target), same format as --glossary")
     context = parser.add_mutually_exclusive_group()
     context.add_argument("--context", metavar="TEXT",
                          help="background information about the document")
@@ -622,6 +745,23 @@ def parse_args(argv):
         parser.error("--form requires --to ja (or auto)")
     if args.chunk_chars < MIN_CHUNK_CHARS:
         parser.error(f"--chunk-chars must be at least {MIN_CHUNK_CHARS}")
+    if args.intermediate is None:
+        if args.glossary2:
+            parser.error("--glossary2 requires --intermediate")
+        if args.intermediate_output:
+            parser.error("--intermediate-output requires --intermediate")
+        return args
+    if args.intermediate not in LANGUAGE_CODES:
+        parser.error(f"unknown --intermediate language: {args.intermediate} "
+                     "(see --list-languages)")
+    if args.target == "auto":
+        parser.error("--intermediate requires --to LANG (not auto)")
+    if args.target == args.intermediate:
+        parser.error("--intermediate and --to must be different languages")
+    if args.output is None:
+        parser.error('--intermediate requires -o PATH (or "-o -" for standard output)')
+    if args.intermediate_output == "-":
+        parser.error("--intermediate-output must be a file")
     return args
 
 
@@ -645,6 +785,7 @@ def main(argv=None):
         api_key = os.environ.get("PLAMO3_LLAMA_API_KEY", "").strip()
     llama = Llama(args.url.rstrip("/"), api_key)
     glossary = parse_glossary(args.glossary) if args.glossary else []
+    glossary2 = parse_glossary(args.glossary2) if args.glossary2 else []
     context = args.context
     if args.context_file:
         context = read_text_file(args.context_file, "context file")
@@ -683,20 +824,20 @@ def main(argv=None):
     check_reserved(source_text, f"{name}")
 
     # Languages
+    intermediate = args.intermediate
     target = args.target
     if target == "auto":
         target = auto_target(source_text, args.source)
-    kwargs = {"target_lang": target}
-    if args.source:
-        kwargs["source_lang"] = args.source
-    if args.form and target == "ja":
-        kwargs["form"] = args.form
-    if glossary:
-        kwargs["glossary"] = glossary
-    if context:
-        kwargs["context"] = context
+    if intermediate:
+        # Round trip: source -> intermediate (first glossary), intermediate -> target
+        # (second glossary, form).
+        kwargs = template_kwargs(target, intermediate, args.form, glossary2, context)
+        kwargs1 = template_kwargs(intermediate, args.source, None, glossary, context)
+    else:
+        kwargs = template_kwargs(target, args.source, args.form, glossary, context)
 
     # Output
+    input_path = None if from_stdin else args.input
     output = None
     if not to_stdout:
         if args.output is not None:
@@ -704,88 +845,72 @@ def main(argv=None):
         else:
             source = args.source or ("ja" if looks_japanese(source_text) else "en")
             output = auto_output_path(args.input, target, source)
-        if not from_stdin and same_file(args.input, output):
-            raise UsageError(f"output {output} is the input file")
-        if os.path.isdir(output):
-            raise UsageError(f"output {output} is a directory")
-        if os.path.lexists(output) and not args.force:
-            raise UsageError(f"output {output} exists (use -f to overwrite)")
+        check_output(output, input_path, args.force, "output")
+    intermediate_output = args.intermediate_output
+    if intermediate_output:
+        check_output(intermediate_output, input_path, args.force, "intermediate output")
+        if output and same_file(intermediate_output, output):
+            raise UsageError(f"intermediate output {intermediate_output} is the output file")
 
-    chunks = [piece for translate, piece in pieces if translate]
-    progress.info(f"Translating {name} into {target} ({len(chunks)} chunk"
-                  f"{'s' if len(chunks) != 1 else ''}, {len(source_text)} characters, "
+    bodies, frames, tail = layout(pieces)
+    count = f"{len(bodies)} chunk{'s' if len(bodies) != 1 else ''}"
+    progress.info(f"Translating {name} into {target}"
+                  + (f" via {intermediate}" if intermediate else "")
+                  + f" ({count}, {len(source_text)} characters, "
                   f"{'markdown' if markdown else 'text'})"
-                  + (f" -> {output}" if output else ""))
+                  + (f" -> {output}" if output else "")
+                  + (f", intermediate -> {intermediate_output}" if intermediate_output else ""))
 
-    temp = None
+    files = []
     try:
         if output:
-            directory = os.path.dirname(output) or "."
-            try:
-                fd, temp = tempfile.mkstemp(dir=directory,
-                                            prefix="." + os.path.basename(output) + ".",
-                                            suffix=".tmp")
-            except OSError as e:
-                raise UsageError(f"cannot write to {directory}: {e.strerror}")
-            fh = os.fdopen(fd, "wb")
+            out_file = OutputFile(output)
+            files.append(out_file)
+            fh = out_file.fh
         else:
             fh = sys.stdout.buffer
+        if intermediate_output:
+            intermediate_file = OutputFile(intermediate_output)
+            files.append(intermediate_file)
         writer = Writer(fh, bom, crlf)
 
         t0 = time.monotonic()
-        history = []
-        index = 0
-        pending = ""  # copied text not yet written
-        for translate, piece in pieces:
-            if not translate:
-                pending += piece
-                continue
-            index += 1
-            body = piece.strip()
-            lead = piece[:len(piece) - len(piece.lstrip())]
-            trail = piece[len(piece.rstrip()):]
-            # History: the preceding pairs, newest first, up to 2.5 x --chunk-chars in all.
-            context_pairs, size = [], 0
-            for pair in reversed(history):
-                size += len(pair[0]) + len(pair[1])
-                if size > HISTORY_FACTOR * args.chunk_chars:
-                    break
-                context_pairs.insert(0, pair)
-            progress.start(index, len(chunks), len(body))
-            try:
-                translation = llama.translate(context_pairs, body, kwargs, progress.event)
-            except BaseException:
-                progress.abort()
-                raise
-            progress.finish(translation)
-            history.append((body, translation))
-            writer.write(pending + lead + translation + trail)
-            pending = ""
-        writer.write(pending)
+        if intermediate:
+            progress.info(f"Pass 1/2: {args.source or 'auto'} -> {intermediate}")
+            intermediates = []
+
+            def keep(index, translation):
+                if not translation:
+                    raise TranslateError(f"chunk {index + 1}: the translation into "
+                                         f"{intermediate} is empty")
+                intermediates.append(translation)
+
+            translate_pass(llama, bodies, kwargs1, args.chunk_chars, progress, keep)
+            if intermediate_output:
+                intermediate_writer = Writer(intermediate_file.fh, bom, crlf)
+                for (prefix, suffix), translation in zip(frames, intermediates):
+                    intermediate_writer.write(prefix + translation + suffix)
+                intermediate_writer.write(tail)
+                intermediate_file.commit()
+                progress.info(f"Intermediate document written to {intermediate_output}")
+            progress.info(f"Pass 2/2: {intermediate} -> {target}")
+            # The chunks stay those of the source: the intermediate text is not split again.
+            bodies = intermediates
+
+        def emit(index, translation):
+            prefix, suffix = frames[index]
+            writer.write(prefix + translation + suffix)
+
+        translate_pass(llama, bodies, kwargs, args.chunk_chars, progress, emit)
+        writer.write(tail)
 
         if output:
-            fh.close()
-            try:
-                mode = os.stat(output).st_mode & 0o7777
-            except OSError:
-                umask = os.umask(0)
-                os.umask(umask)
-                mode = 0o666 & ~umask
-            os.chmod(temp, mode)
-            os.replace(temp, output)
-            temp = None
-        progress.info(f"Done: {len(chunks)} chunk{'s' if len(chunks) != 1 else ''} in "
+            out_file.commit()
+        progress.info(f"Done: {count}{' x 2 passes' if intermediate else ''} in "
                       f"{time.monotonic() - t0:.1f} s" + (f", written to {output}" if output else ""))
     finally:
-        if temp is not None:
-            try:
-                fh.close()
-            except (OSError, NameError):
-                pass
-            try:
-                os.unlink(temp)
-            except OSError:
-                pass
+        for file in files:
+            file.discard()
     return 0
 
 
