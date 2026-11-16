@@ -118,6 +118,7 @@ PLAMO3INS_INTERACTIVE=no
 [[ -t 0 ]] && PLAMO3INS_INTERACTIVE=yes
 PLAMO3INS_UFW_RULES=""   # ufw rules added by the installer: PORT (any interface) or PORT@INTERFACE
 PLAMO3INS_N_CTX=""
+PLAMO3INS_GPU_LINES=""   # "using device ..." lines of llama-server; set by probe_gpus
 
 # ---------------------------------------------------------------- utilities
 
@@ -333,7 +334,8 @@ detect_gpu() {
 #   CUDA   CUDA_VISIBLE_DEVICES=<GPU UUIDs from nvidia-smi>
 #   ROCm   ROCR_VISIBLE_DEVICES=<GPU agent indices, in KFD topology node order>
 #   Vulkan GGML_VK_VISIBLE_DEVICES=<indices in vkEnumeratePhysicalDevices order>
-# After start-up, the "using device ... (<PCI address>)" lines of llama-server are checked.
+# Before start-up, a test run of llama-server with -lv 4 (probe_gpus) shows the devices it
+# uses ("using device ... (<PCI address>)"), which report_gpus compares with the selection.
 
 # normalize_pci ADDRESS: print a PCI address as dddd:bb:dd.f (lower case), or nothing if invalid.
 normalize_pci() {
@@ -1317,6 +1319,7 @@ start_services() {
   # it is not waited for here: wait_health does that, with a time limit.  Stopping first
   # makes sure that wait_health does not get an answer from the previous llama-server.
   systemctl stop "$PLAMO3INS_LLAMA_UNIT"
+  probe_gpus
   systemctl start --no-block "$PLAMO3INS_LLAMA_UNIT"
   systemctl restart "$PLAMO3INS_UWSGI_UNIT" || {
     journalctl -u "$PLAMO3INS_UWSGI_UNIT" -n 30 --no-pager >&2 || true
@@ -1512,15 +1515,41 @@ wait_health() {
   report_gpus
 }
 
-# Show the GPUs llama-server uses ("using device ... (<PCI address>)" in its log) and
-# compare them with the selection.
-report_gpus() {
-  local PLAMO3INS_pid PLAMO3INS_lines PLAMO3INS_line PLAMO3INS_used PLAMO3INS_expected
+# Find the GPUs llama-server uses, for report_gpus.  llama-server logs them ("using device
+# <name> (<description>) (<PCI address>) - <N> MiB free") only with -lv 4, which is too noisy
+# for the service (about five times the lines per request).  So llama-server is run here
+# once with -lv 4 as a transient unit with the user, groups and environment of the llama
+# unit, and stopped when it begins to load the tensors: the lines come before that.  It
+# listens on a UNIX socket of its own (llama-server binds before it loads the model),
+# offloads nothing (-ngl 0) and runs while the llama unit is stopped, so it does not need
+# free GPU memory beyond what the backend takes to initialize.
+probe_gpus() {
+  local PLAMO3INS_unit="$PLAMO3INS_APP_NAME-gpu-probe.service" PLAMO3INS_d=${PLAMO3INS_VAL[DESTDIR]}
+  local PLAMO3INS_gguf PLAMO3INS_p PLAMO3INS_props=()
+  PLAMO3INS_GPU_LINES=""
   [[ ${PLAMO3INS_VAL[BACKEND]} != cpu ]] || return 0
-  PLAMO3INS_pid=$(systemctl show -p MainPID --value "$PLAMO3INS_LLAMA_UNIT")
-  PLAMO3INS_lines=$(journalctl -u "$PLAMO3INS_LLAMA_UNIT" "_PID=$PLAMO3INS_pid" -o cat --no-pager 2>/dev/null | grep -o 'using device .*' || true)
+  PLAMO3INS_gguf=$(gguf_name "${PLAMO3INS_VAL[MODEL]}" "${PLAMO3INS_VAL[QUANT]}")
+  for PLAMO3INS_p in User Group SupplementaryGroups Environment; do
+    PLAMO3INS_props+=(-p "$PLAMO3INS_p=$(systemctl show -p "$PLAMO3INS_p" --value "$PLAMO3INS_LLAMA_UNIT")")
+  done
+  systemctl stop "$PLAMO3INS_unit" 2>/dev/null || true
+  systemctl reset-failed "$PLAMO3INS_unit" 2>/dev/null || true
+  # llama-server ignores SIGPIPE, hence the explicit stop; RuntimeMaxSec is the safety net
+  # in case the log format changes and sed never quits.
+  PLAMO3INS_GPU_LINES=$(systemd-run --quiet --collect --pipe --wait --unit "$PLAMO3INS_unit" \
+      "${PLAMO3INS_props[@]}" -p "CacheDirectory=$PLAMO3INS_APP_NAME" \
+      -p "RuntimeDirectory=$PLAMO3INS_APP_NAME-gpu-probe" -p RuntimeDirectoryMode=0750 -p RuntimeMaxSec=120 \
+      "$PLAMO3INS_d/llama.cpp/current/llama-server" --model "$PLAMO3INS_d/models/$PLAMO3INS_gguf" \
+      --host "/run/$PLAMO3INS_APP_NAME-gpu-probe/probe.sock" -lv 4 -ngl 0 -fit off -c 512 --no-warmup </dev/null 2>&1 \
+    | { sed -n 's/.*\(using device .*\)/\1/p; /load_tensors:/q'; systemctl stop "$PLAMO3INS_unit" 2>/dev/null; }) || true
+}
+
+# Show the GPUs llama-server uses (found by probe_gpus) and compare them with the selection.
+report_gpus() {
+  local PLAMO3INS_lines=$PLAMO3INS_GPU_LINES PLAMO3INS_line PLAMO3INS_used PLAMO3INS_expected
+  [[ ${PLAMO3INS_VAL[BACKEND]} != cpu ]] || return 0
   if [[ -z $PLAMO3INS_lines ]]; then
-    warn "llama-server does not use any GPU (no \"using device\" in journalctl -u $PLAMO3INS_LLAMA_UNIT); it runs on the CPU"
+    warn "llama-server does not find any GPU with the ${PLAMO3INS_VAL[BACKEND]} backend (no \"using device\" in a test run with -lv 4); it runs on the CPU"
     return 0
   fi
   while IFS= read -r PLAMO3INS_line; do info "llama-server is $PLAMO3INS_line"; done <<<"$PLAMO3INS_lines"
