@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""PLaMo 3 Translate web server (WSGI application for uWSGI).
+"""PLaMo 3 Translate web server (WSGI application for uWSGI; stand-alone server).
 
 GET  /               translation form (HTML)
 POST /api/translate  JSON API:
@@ -19,7 +19,7 @@ POST /api/translate  JSON API:
              A translation cut off at the token limit (finish_reason "length") is an
              error, not a partial result: 400 when the context is full, 502 when the
              output reached max_tokens (e.g. repetition); the token counts are logged
-             to stderr (the uWSGI journal).
+             to stderr.
     With "stream": true, a 200 response is NDJSON (application/x-ndjson), one object
              per line, sent as llama-server makes progress:
              {"target_lang": str}                            first
@@ -30,6 +30,16 @@ POST /api/translate  JSON API:
 
 The request is forwarded to llama-server's /v1/chat/completions with the
 translation settings in chat_template_kwargs.  Python standard library only.
+
+Under uWSGI the entry point is the "application" callable.  Without uWSGI (Windows,
+development) the file is run as a script and serves the same application itself, one
+thread per request:
+    plamo-3-translate-server.py [--host ADDR] [--port PORT] [PORT]
+        --host ADDR   address to listen on (default 127.0.0.1; 0.0.0.0 for all)
+        --port PORT   port to listen on (default 8080); the positional PORT is the same
+    It prints "Serving on http://<host>:<port>/ (llama-server: <PLAMO3_LLAMA_URL>)" to
+    stdout once it is listening, exits with status 1 (and a one-line message on stderr)
+    when it cannot listen on the address, and with status 0 on Ctrl-C.
 
 Environment variables:
     PLAMO3_LLAMA_URL        llama-server address: unix:<socket path> or http://<host>:<port>
@@ -129,6 +139,10 @@ class UnixHTTPConnection(http.client.HTTPConnection):
 def llama_connection():
     """Return (connection, path prefix) for PLAMO3_LLAMA_URL."""
     if LLAMA_URL.startswith("unix:"):
+        if not hasattr(socket, "AF_UNIX"):  # e.g. Python on Windows
+            raise UpstreamError("PLAMO3_LLAMA_URL is a UNIX domain socket (unix:<path>), which "
+                                "Python does not support on this platform; set it to "
+                                "http://<host>:<port>")
         return UnixHTTPConnection(LLAMA_URL[len("unix:"):], LLAMA_TIMEOUT), ""
     url = urllib.parse.urlsplit(LLAMA_URL)
     if url.scheme != "http" or not url.hostname:
@@ -228,13 +242,14 @@ def _max_tokens(text):
 
 CUT_OFF_CONTEXT = ("The translation was cut off: the text is too long for this server (the source "
                    "and the translation must fit in its context).  Translate the text in smaller "
-                   "parts; if you need to translate longer texts at once, contact the "
-                   "administrator.")
+                   "parts; if you need to translate longer texts at once, see the server "
+                   "log or contact the administrator.")
 CUT_OFF_OUTPUT = ("The translation was cut off: the output reached its limit (the model may have "
                   "kept repeating itself).  Try again with a shorter or reworded text; if this "
-                  "keeps happening, contact the administrator.")
+                  "keeps happening, see the server log or contact the administrator.")
 CUT_OFF_UNKNOWN = ("The translation was cut off at the token limit.  Try again with a shorter "
-                   "text; if this keeps happening, contact the administrator.")
+                   "text; if this keeps happening, see the server log or contact the "
+                   "administrator.")
 
 
 def _cut_off(text, timings):
@@ -902,12 +917,75 @@ INDEX_HTML = """<!doctype html>
 """
 
 
-if __name__ == "__main__":
-    # Development server: python3 plamo-3-translate-server.py [port]
-    import sys
-    from wsgiref.simple_server import make_server
+def main(argv=None):
+    """Stand-alone server (no uWSGI): see the module docstring."""
+    import argparse
+    import socketserver
+    from wsgiref.simple_server import WSGIRequestHandler, WSGIServer
 
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
-    with make_server("127.0.0.1", port, application) as httpd:
-        print(f"Serving on http://127.0.0.1:{port}/ (llama-server: {LLAMA_URL})")
-        httpd.serve_forever()
+    def port_number(value):
+        port = int(value)
+        if not 0 <= port <= 65535:
+            raise ValueError(value)
+        return port
+    port_number.__name__ = "port"  # for argparse's "invalid port value" message
+
+    parser = argparse.ArgumentParser(
+        description="PLaMo 3 Translate web server (stand-alone mode, without uWSGI).")
+    parser.add_argument("--host", default="127.0.0.1", metavar="ADDR",
+                        help="address to listen on (default: %(default)s; 0.0.0.0 for all)")
+    parser.add_argument("--port", type=port_number, metavar="PORT",
+                        help="port to listen on (default: 8080)")
+    parser.add_argument("positional_port", nargs="?", type=port_number, metavar="PORT",
+                        help="the same as --port PORT")
+    args = parser.parse_args(argv)
+    if args.port is not None and args.positional_port is not None:
+        parser.error("PORT given twice (--port PORT and PORT)")
+    port = next((p for p in (args.port, args.positional_port) if p is not None), 8080)
+
+    # A console with a legacy code page (e.g. cp932) cannot show every character:
+    # escape instead of raising UnicodeEncodeError.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
+
+    class Server(socketserver.ThreadingMixIn, WSGIServer):
+        daemon_threads = True  # do not wait for running translations on exit
+        # On Windows SO_REUSEADDR would let this process listen on a port that another
+        # process is already listening on; take the port exclusively there instead.
+        allow_reuse_address = sys.platform != "win32"
+
+        def server_bind(self):
+            if sys.platform == "win32":
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            socketserver.TCPServer.server_bind(self)
+            # Not WSGIServer.server_bind: its socket.getfqdn() can take seconds.
+            self.server_name, self.server_port = self.server_address[:2]
+            self.setup_environ()
+
+        def handle_error(self, request, client_address):
+            if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+                return  # the client went away: nothing to report
+            super().handle_error(request, client_address)
+
+    try:
+        httpd = Server((args.host, port), WSGIRequestHandler)
+    except OSError as e:
+        print(f"plamo-3-translate-server: cannot listen on {args.host}:{port}: {e}",
+              file=sys.stderr, flush=True)
+        return 1
+    try:
+        with httpd:
+            httpd.set_app(application)
+            host, port = httpd.server_address[:2]
+            print(f"Serving on http://{host}:{port}/ (llama-server: {LLAMA_URL})", flush=True)
+            httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
