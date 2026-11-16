@@ -2,8 +2,10 @@
 """PLaMo 3 Translate command-line client.
 
 Translates a plain text or Markdown file (or standard input) by talking to llama-server
-directly (the TCP port set up by install-plamo-3-translate.sh, 127.0.0.1:28080 by default),
-keeping the layout of the document.  Python standard library only.
+directly (the TCP port set up by install-plamo-3-translate.sh on Ubuntu and by
+plamo-3-translate-installer-for-windows on Windows, 127.0.0.1:28080 by default), keeping the
+layout of the document.  Python standard library only; runs on Linux and Windows.  Files,
+standard input and a translation on standard output are UTF-8 on both.
 
 Long documents are split into chunks (paragraphs, then lines) of at most --chunk-chars
 characters; each request carries the preceding source/translation pairs as history so that
@@ -21,22 +23,31 @@ Environment variables:
     PLAMO3_LLAMA_API_KEY    llama-server API key (needed when llama-server is exposed);
                             --api-key-file overrides it
 
-Exit status: 0 success, 1 translation error (connection, API key, llama-server error),
-2 invalid arguments or input, 130 interrupted.
+Exit status: 0 success, 1 translation error (connection, API key, llama-server error, an
+output file that cannot be put in place, the reader of standard output gone), 2 invalid
+arguments or input, 130 interrupted.
 """
 
 import argparse
+import errno
 import http.client
 import json
 import os
+import queue
 import re
+import socket
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 
+WINDOWS = sys.platform == "win32"
 DEFAULT_URL = "http://127.0.0.1:28080"
 TIMEOUT = 3600
+# The main thread waits for llama-server in steps of this many seconds: on Windows Ctrl-C
+# interrupts neither a blocking socket call nor a wait on a lock, only the time between two.
+POLL_SECONDS = 0.5
 # install-plamo-3-translate.sh warns when the llama-server context is smaller than these
 # defaults may need (PLAMO3INS_CLIENT_CHUNK_CHARS, PLAMO3INS_CLIENT_CTX); keep them in sync.
 DEFAULT_CHUNK_CHARS = 20000
@@ -115,16 +126,28 @@ def lines_of(text):
     return re.findall(r"[^\n]*\n|[^\n]+$", text)
 
 
+def decode_utf8(data, name, stdin=False):
+    """Decode UTF-8 (a BOM is dropped); name is what the error message calls the data."""
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        message = f"{name} is not valid UTF-8 (byte {e.start})"
+        if not stdin:
+            message += "; save the file as UTF-8"
+        elif WINDOWS:
+            # e.g. "echo ... | client -" in cmd.exe: the pipe carries the console code page.
+            message += ("\nStandard input must be UTF-8.  Save the text as a UTF-8 file and "
+                        "give the file instead.")
+        raise UsageError(message)
+
+
 def read_text_file(path, what):
     try:
         with open(path, "rb") as f:
             data = f.read()
     except OSError as e:
         raise UsageError(f"cannot read {what} {path}: {e.strerror}")
-    try:
-        return data.decode("utf-8-sig")
-    except UnicodeDecodeError as e:
-        raise UsageError(f"{what} {path} is not valid UTF-8 (byte {e.start})")
+    return decode_utf8(data, f"{what} {path}")
 
 
 def check_reserved(text, what):
@@ -360,19 +383,58 @@ class Llama:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = "Bearer " + self.api_key
+        body = json.dumps(payload).encode("utf-8")
         conn = http.client.HTTPConnection(self.host, self.port, timeout=TIMEOUT)
-        try:
+        # The request is made in a daemon thread and its events are handed over through a
+        # queue, so that the main thread never sits in a socket call and Ctrl-C works at
+        # once on Windows too (see POLL_SECONDS).  on_event is called in the main thread.
+        events = queue.Queue()
+
+        def work():
             try:
-                conn.request("POST", self.prefix + "/v1/chat/completions",
-                             body=json.dumps(payload).encode("utf-8"), headers=headers)
-                response = conn.getresponse()
-                if response.status != 200:
-                    raise self._error(response.status, response.read())
-            except (OSError, http.client.HTTPException) as e:
-                raise TranslateError(f"cannot connect to llama-server ({self.url}): {e}")
-            return self._read_stream(response, on_event)
-        finally:
-            conn.close()
+                try:
+                    try:
+                        conn.request("POST", self.prefix + "/v1/chat/completions",
+                                     body=body, headers=headers)
+                        response = conn.getresponse()
+                        if response.status != 200:
+                            raise self._error(response.status, response.read())
+                    except (OSError, http.client.HTTPException) as e:
+                        raise TranslateError(
+                            f"cannot connect to llama-server ({self.url}): {e}")
+                    result = self._read_stream(
+                        response, lambda *event: events.put(("event", event)))
+                finally:
+                    conn.close()
+            except BaseException as e:
+                events.put(("error", e))
+            else:
+                events.put(("result", result))
+
+        threading.Thread(target=work, daemon=True).start()
+        try:
+            while True:
+                try:
+                    kind, value = events.get(timeout=POLL_SECONDS)
+                except queue.Empty:
+                    continue
+                if kind == "event":
+                    on_event(*value)
+                elif kind == "result":
+                    return value
+                else:
+                    raise value
+        except BaseException:
+            # Ctrl-C, or a failure in on_event: hang up so that llama-server stops
+            # generating.  The thread is not waited for; the caller is on its way out, and
+            # the end of the process closes whatever is left.
+            sock = conn.sock
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            raise
 
     def _read_stream(self, response, on_event):
         parts = []
@@ -436,11 +498,19 @@ class Llama:
 # Output and progress
 
 
-class Writer:
-    """Writes text to a binary file, restoring the BOM and CRLF line ends of the input."""
+def stdout_gone(error):
+    """Whether an OSError from a write to standard output means that its reader went away
+    (e.g. "| head").  On Windows that is EINVAL, not EPIPE (BrokenPipeError)."""
+    return isinstance(error, BrokenPipeError) or (WINDOWS and error.errno == errno.EINVAL)
 
-    def __init__(self, fh, bom, crlf):
-        self.fh, self.bom, self.crlf = fh, bom, crlf
+
+class Writer:
+    """Writes text to a binary file, restoring the BOM and CRLF line ends of the input.
+    With stdout (fh is standard output), a reader that went away raises BrokenPipeError on
+    all platforms."""
+
+    def __init__(self, fh, bom, crlf, stdout=False):
+        self.fh, self.bom, self.crlf, self.stdout = fh, bom, crlf, stdout
 
     def write(self, text):
         if self.crlf:
@@ -449,8 +519,39 @@ class Writer:
         if self.bom:
             data = b"\xef\xbb\xbf" + data
             self.bom = False
-        self.fh.write(data)
-        self.fh.flush()
+        try:
+            self.fh.write(data)
+            self.fh.flush()
+        except OSError as e:
+            if self.stdout and stdout_gone(e) and not isinstance(e, BrokenPipeError):
+                raise BrokenPipeError(errno.EPIPE, "standard output was closed") from None
+            raise
+
+
+def enable_escape_sequences(stream):
+    """Whether the terminal behind stream handles escape sequences.  On Windows this turns
+    on virtual terminal processing, which the older console host needs (Windows Terminal
+    has it on); the mode is left on, as it belongs to the console and not to this process."""
+    if not WINDOWS:
+        return True
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetConsoleMode.restype = wintypes.BOOL
+        kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.SetConsoleMode.restype = wintypes.BOOL
+        handle = msvcrt.get_osfhandle(stream.fileno())
+        mode = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        if mode.value & 0x0004:  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            return True
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+    except Exception:  # no ctypes, no console API, not a console, ...
+        return False
 
 
 class Progress:
@@ -461,22 +562,32 @@ class Progress:
         self.quiet = quiet
         self.show_text = show_text
         self.tty = sys.stderr.isatty()
+        # Without escape sequences the rest of the status line is erased with spaces.
+        self.escapes = self.tty and enable_escape_sequences(sys.stderr)
         self.status = ""   # current \r status line (tty only)
+        self.width = 0     # characters on the terminal line (the status lines are ASCII)
 
     def _put(self, text):
         sys.stderr.write(text)
         sys.stderr.flush()
 
+    def _line(self, text):
+        """Replace the terminal line with text, leaving the cursor after it."""
+        erase = "\033[K" if self.escapes else " " * (self.width - len(text))
+        self.width = len(text)
+        return "\r" + text + erase
+
     def _set_status(self, text):
         if self.tty:
-            self._put("\r" + text + "\033[K")
+            self._put(self._line(text))
             self.status = text
 
     def _end_status(self, text=None):
         if self.status or text:
-            self._put("\r" + (text if text is not None else self.status) + "\033[K\n"
+            self._put(self._line(text if text is not None else self.status) + "\n"
                       if self.tty else (text or "") + "\n")
         self.status = ""
+        self.width = 0
 
     def warn(self, message):
         if self.status:
@@ -573,11 +684,22 @@ def check_output(path, input_path, force, what):
         raise UsageError(f"{what} {path} is a directory")
     if os.path.lexists(path) and not force:
         raise UsageError(f"{what} {path} exists (use -f to overwrite)")
+    if WINDOWS and os.path.lexists(path):
+        # On Windows a file that is read-only, or open in a program that locks it, cannot
+        # be replaced: say so before translating.  (OutputFile.commit() handles a file that
+        # gets locked later.  Not done elsewhere: on POSIX replacing needs no write access.)
+        try:
+            with open(path, "r+b"):
+                pass
+        except OSError as e:
+            raise UsageError(f"{what} {path} cannot be overwritten: {e.strerror} "
+                             "(is it read-only, or open in another program?)")
 
 
 class OutputFile:
     """A file written through a temporary file in the same directory: commit() renames it
-    to path, discard() removes it (and does nothing after commit())."""
+    to path, discard() removes it (and does nothing after commit()).  When the temporary
+    file cannot be renamed, commit() raises TranslateError and the file is kept."""
 
     def __init__(self, path):
         self.path = path
@@ -598,9 +720,17 @@ class OutputFile:
             umask = os.umask(0)
             os.umask(umask)
             mode = 0o666 & ~umask
-        os.chmod(self.temp, mode)
-        os.replace(self.temp, self.path)
-        self.temp = None
+        try:
+            os.chmod(self.temp, mode)  # on Windows: only the read-only flag
+        except OSError:
+            pass
+        temp, self.temp = self.temp, None  # from here on discard() keeps the file
+        try:
+            os.replace(temp, self.path)
+        except OSError as e:
+            # e.g. on Windows: the destination is open in another program, or read-only.
+            raise TranslateError(f"cannot write {self.path}: {e.strerror or e}; "
+                                 f"the text is kept in {os.path.abspath(temp)}")
 
     def discard(self):
         if self.temp is None:
@@ -768,8 +898,14 @@ def parse_args(argv):
 def main(argv=None):
     args = parse_args(argv)
     if args.list_languages:
-        for code, name in LANGUAGES:
-            print(f"{code}\t{name}")
+        try:
+            for code, name in LANGUAGES:
+                print(f"{code}\t{name}")
+            sys.stdout.flush()
+        except OSError as e:
+            if stdout_gone(e):
+                raise BrokenPipeError(errno.EPIPE, "standard output was closed") from None
+            raise
         return 0
 
     from_stdin = args.input == "-"
@@ -796,7 +932,8 @@ def main(argv=None):
     # Input
     if from_stdin:
         if sys.stdin.isatty() and not args.quiet:
-            progress.info("Reading standard input (end with Ctrl-D)...")
+            progress.info("Reading standard input (end with "
+                          + ("Ctrl-Z and Enter" if WINDOWS else "Ctrl-D") + ")...")
         data = sys.stdin.buffer.read()
         name = "standard input"
     else:
@@ -807,10 +944,7 @@ def main(argv=None):
             raise UsageError(f"cannot read {args.input}: {e.strerror}")
         name = args.input
     bom = data.startswith(b"\xef\xbb\xbf")
-    try:
-        text = data.decode("utf-8-sig")
-    except UnicodeDecodeError as e:
-        raise UsageError(f"{name} is not valid UTF-8 (byte {e.start})")
+    text = decode_utf8(data, name, stdin=from_stdin)
     crlf = "\r\n" in text
     text = text.replace("\r\n", "\n")
 
@@ -862,6 +996,7 @@ def main(argv=None):
                   + (f", intermediate -> {intermediate_output}" if intermediate_output else ""))
 
     files = []
+    intermediate_error = None
     try:
         if output:
             out_file = OutputFile(output)
@@ -872,7 +1007,7 @@ def main(argv=None):
         if intermediate_output:
             intermediate_file = OutputFile(intermediate_output)
             files.append(intermediate_file)
-        writer = Writer(fh, bom, crlf)
+        writer = Writer(fh, bom, crlf, stdout=not output)
 
         t0 = time.monotonic()
         if intermediate:
@@ -891,8 +1026,15 @@ def main(argv=None):
                 for (prefix, suffix), translation in zip(frames, intermediates):
                     intermediate_writer.write(prefix + translation + suffix)
                 intermediate_writer.write(tail)
-                intermediate_file.commit()
-                progress.info(f"Intermediate document written to {intermediate_output}")
+                try:
+                    intermediate_file.commit()
+                except TranslateError as e:
+                    # The intermediate text is kept in its temporary file; go on with the
+                    # second pass and fail at the end.
+                    intermediate_error = e
+                    progress.warn(f"{e}; continuing with pass 2")
+                else:
+                    progress.info(f"Intermediate document written to {intermediate_output}")
             progress.info(f"Pass 2/2: {intermediate} -> {target}")
             # The chunks stay those of the source: the intermediate text is not split again.
             bodies = intermediates
@@ -906,6 +1048,9 @@ def main(argv=None):
 
         if output:
             out_file.commit()
+        if intermediate_error:
+            progress.info("Pass 2 is complete" + (f", written to {output}" if output else ""))
+            raise intermediate_error
         progress.info(f"Done: {count}{' x 2 passes' if intermediate else ''} in "
                       f"{time.monotonic() - t0:.1f} s" + (f", written to {output}" if output else ""))
     finally:
